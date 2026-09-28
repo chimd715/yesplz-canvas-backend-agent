@@ -94,10 +94,12 @@ async fn invalid_cursors_and_oversized_records_never_advance_delivery() {
     ));
     conversation(db.pool(), "large", "system_default_user").await;
     // The normal insert is exportable; the following direct update is not.
+    // Keep extra valid JSON: the existing cron-job expression index evaluates
+    // json_extract(extra, '$.cronJobId') before the outbox can export the row.
     let first = repo.export("system_default_user", None, 100).await.unwrap();
     repo.acknowledge("system_default_user", first.through_sequence).await.unwrap();
     sqlx::query("UPDATE conversations SET extra = ? WHERE id = 'large'")
-        .bind("x".repeat(16 * 1024 * 1024))
+        .bind(serde_json::json!({ "fixture": "x".repeat(16 * 1024 * 1024) }).to_string())
         .execute(db.pool())
         .await
         .unwrap();
