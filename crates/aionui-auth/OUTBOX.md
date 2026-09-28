@@ -80,6 +80,30 @@ agent session files, or restore rows. Those operations require a coordinated
 platform persistence/restore implementation before central durability can be
 claimed. A captured message transcript is not a native resumable session.
 
+The conversation relay now carries local SQLite write failures to the turn
+orchestrator, prevents automatic replay after such failures, and emits an error
+instead of successful turn completion. The orchestrator keeps its turn claim
+through the final conversation-status write. This is a local failure boundary;
+it does not wait for the platform outbox acknowledgment.
+
+Two integration gaps must be closed before accepting hosted turns as durable:
+
+1. Core currently generates message and turn IDs for every send request. Add a
+   durable platform request ID to Core message/turn mapping and a verified
+   accepted-request receipt. A retry after a lost Core response must return the
+   existing mapping rather than execute again. Ordinary, mid-turn, and internal
+   agent-turn entry paths must all honor the hosted acceptance gate. Persisting
+   input only at the platform without this mapping is insufficient.
+2. The pinned aionrs v0.2.11 engine has no public error-returning flush/checkpoint
+   method. Its private `save_session` emits save errors without returning them;
+   `SessionManager` writes a temporary file and renames it without `sync_all`.
+   Verified against commit `8e61a90329fa9f67c4fdf7e97fe02c24dba33f75`,
+   [engine.rs](https://github.com/iOfficeAI/aionrs/blob/8e61a90329fa9f67c4fdf7e97fe02c24dba33f75/crates/aion-agent/src/engine.rs#L1512)
+   and [session.rs](https://github.com/iOfficeAI/aionrs/blob/8e61a90329fa9f67c4fdf7e97fe02c24dba33f75/crates/aion-agent/src/session.rs#L448).
+   A supported Result-returning engine checkpoint API is required before Core
+   can acknowledge a consistent native-session checkpoint. Do not infer that a
+   streamed Finish proves the session file was saved.
+
 History currently has no pruning policy. Repeated message updates append complete
 rows and can grow the database substantially. Add checkpoint-aware retention only
 after external recovery is verified. Back up the complete data directory before

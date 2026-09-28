@@ -414,19 +414,29 @@ impl ConversationTurnOrchestrator {
                 }
             });
 
-            let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
-            aggregate_summary.merge(&outcome.attempt);
+            let mut outcome = relay.consume_with_send_error(rx, send_error_rx).await;
 
-            if let Some(session_key) = agent.get_session_key() {
-                persist_session_key(
+            if let Some(session_key) = agent.get_session_key()
+                && let Err(error) = persist_session_key(
                     self.service.conversation_repo(),
                     &persistence,
                     &input.user_id,
                     &input.conv_id,
                     &session_key,
                 )
-                .await;
+                .await
+            {
+                error!(conversation_id = %input.conv_id, error = %ErrorChain(&error), "Failed to persist session key");
+                let error = crate::runtime_completion::local_persistence_error();
+                outcome.attempt.local_persistence_failed = true;
+                outcome.attempt.terminal_error = Some(error);
+                outcome.terminal = crate::stream_relay::RelayTerminal::Error {
+                    code: Some(AgentErrorCode::AionuiInternalError),
+                    retryable: Some(false),
+                };
+                outcome.system_responses.clear();
             }
+            aggregate_summary.merge(&outcome.attempt);
 
             match continuation_policy.decide(&input.conv_id, continuation_count, &outcome, lifecycle) {
                 ContinuationDecision::Continue { content, next_count } => {
@@ -477,10 +487,11 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut local_persistence_failed = false;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
-        let final_failed = loop {
+        let mut final_failed = loop {
             let attempt_number = if replayed { 2 } else { 1 };
             let attempt_result = match self
                 .run_attempt(TurnAttemptInput {
@@ -505,6 +516,12 @@ impl ConversationTurnOrchestrator {
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
+
+            if attempt_result.summary.local_persistence_failed {
+                local_persistence_failed = true;
+                final_error_message = Some(crate::runtime_completion::local_persistence_error().message);
+                break true;
+            }
 
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
@@ -641,10 +658,32 @@ impl ConversationTurnOrchestrator {
             .await;
         }
 
+        let publisher = self.service.completion_publisher(&input.user_id);
+        // Keep the claim through the final SQLite status write. A following
+        // turn must not start while this turn is still mutating local history.
+        let completion_persisted = if local_persistence_failed {
+            false
+        } else {
+            match publisher.persist_finished(&conv_id, &turn_id).await {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    error!(conversation_id = %conv_id, turn_id, error = %ErrorChain(&error), "Failed to persist turn completion");
+                    local_persistence_failed = true;
+                    final_failed = true;
+                    final_error_message = Some(crate::runtime_completion::local_persistence_error().message);
+                    false
+                }
+            }
+        };
         let was_deleting = turn_claim.release_for_turn(&turn_id);
-        self.service
-            .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
-            .await;
+        if !was_deleting {
+            if local_persistence_failed {
+                publisher.publish_failure(&conv_id, &turn_id, &first_turn_msg_id);
+            } else if completion_persisted {
+                let runtime = self.service.runtime_summary_for(&conv_id).await;
+                publisher.publish_persisted(&conv_id, &turn_id, Some(runtime));
+            }
+        }
 
         ConversationTurnResult {
             status: if final_failed {

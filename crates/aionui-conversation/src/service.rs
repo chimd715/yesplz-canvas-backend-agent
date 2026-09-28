@@ -928,9 +928,11 @@ impl ConversationService {
 
     pub async fn complete_turn(&self, user_id: &str, conversation_id: &str, turn_id: &str) {
         let runtime = self.runtime_summary_for(conversation_id).await;
-        self.completion_publisher(user_id)
-            .publish(conversation_id, turn_id, Some(runtime))
-            .await;
+        let publisher = self.completion_publisher(user_id);
+        if let Err(error) = publisher.publish(conversation_id, turn_id, Some(runtime)).await {
+            error!(conversation_id, turn_id, error = %ErrorChain(&error), "Failed to persist turn completion");
+            publisher.publish_failure(conversation_id, turn_id, turn_id);
+        }
     }
 
     pub(crate) async fn complete_released_turn(
@@ -5735,42 +5737,34 @@ pub(crate) async fn persist_session_key(
     user_id: &str,
     conversation_id: &str,
     session_key: &str,
-) {
+) -> Result<(), aionui_db::DbError> {
     if !persistence.allows(conversation_id, RuntimeWriteKind::SessionKey) {
-        return;
+        return Ok(());
     }
 
-    let row = match repo.get(user_id, conversation_id).await {
-        Ok(Some(r)) => r,
-        _ => return,
+    let Some(row) = repo.get(user_id, conversation_id).await? else {
+        return Ok(());
     };
 
     let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
 
     if extra.get("sessionKey").and_then(|v| v.as_str()) == Some(session_key) {
-        return;
+        return Ok(());
     }
 
     extra["sessionKey"] = serde_json::Value::String(session_key.to_owned());
 
-    let extra_json = match serde_json::to_string(&extra) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(conversation_id, error = %ErrorChain(&e), "Failed to serialize extra for session key persist");
-            return;
-        }
-    };
+    let extra_json = serde_json::to_string(&extra)
+        .map_err(|_| aionui_db::DbError::Init("Failed to serialize session key".into()))?;
 
     let update = ConversationRowUpdate {
         extra: Some(extra_json),
         updated_at: Some(now_ms()),
         ..Default::default()
     };
-    if let Err(e) = repo.update(user_id, conversation_id, &update).await {
-        warn!(conversation_id, error = %ErrorChain(&e), "Failed to persist session key");
-    } else {
-        debug!(conversation_id, "Persisted session key to conversation.extra");
-    }
+    repo.update(user_id, conversation_id, &update).await?;
+    debug!(conversation_id, "Persisted session key to conversation.extra");
+    Ok(())
 }
 
 fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifactResponse, ConversationError> {

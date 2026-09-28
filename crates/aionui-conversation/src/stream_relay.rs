@@ -89,6 +89,9 @@ pub struct TurnAttemptSummary {
     pub saw_visible_output: bool,
     pub saw_tool_or_side_effect: bool,
     pub persisted_assistant_output: bool,
+    /// At least one local history write failed. Never auto-replay side effects
+    /// or report a successful completion on the strength of streamed text.
+    pub local_persistence_failed: bool,
     pub terminal_error: Option<ErrorEventData>,
     pub terminal_error_deferred: bool,
     /// The turn ended benignly (a Finish, not an Error) but the agent signalled
@@ -100,13 +103,17 @@ pub struct TurnAttemptSummary {
 
 impl TurnAttemptSummary {
     pub fn safe_to_auto_replay(&self) -> bool {
-        !self.saw_visible_output && !self.saw_tool_or_side_effect && !self.persisted_assistant_output
+        !self.saw_visible_output
+            && !self.saw_tool_or_side_effect
+            && !self.persisted_assistant_output
+            && !self.local_persistence_failed
     }
 
     pub fn merge(&mut self, other: &TurnAttemptSummary) {
         self.saw_visible_output |= other.saw_visible_output;
         self.saw_tool_or_side_effect |= other.saw_tool_or_side_effect;
         self.persisted_assistant_output |= other.persisted_assistant_output;
+        self.local_persistence_failed |= other.local_persistence_failed;
         self.needs_auth |= other.needs_auth;
         if other.terminal_error.is_some() {
             self.terminal_error = other.terminal_error.clone();
@@ -305,7 +312,7 @@ impl StreamRelay {
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
 
-        loop {
+        let mut outcome = loop {
             let recv_result = if send_error_done {
                 if let Some(send_error) = pending_send_error.take() {
                     match rx.try_recv() {
@@ -550,7 +557,6 @@ impl StreamRelay {
                                 )
                                 .await;
                             }
-                            self.forward_to_websocket(&event);
                             if let AgentStreamEvent::Error(data) = &event {
                                 attempt.terminal_error = Some(data.clone());
                             }
@@ -566,6 +572,9 @@ impl StreamRelay {
                             outcome.attempt = attempt.clone();
                             if !full_text_buffer.is_empty() {
                                 outcome.attempt.persisted_assistant_output = true;
+                            }
+                            if !self.adapter.write_failed() {
+                                self.forward_to_websocket(&event);
                             }
                             if self.complete_turn && !deleting {
                                 self.adapter
@@ -700,6 +709,7 @@ impl StreamRelay {
                                     error = %e,
                                     "agent session title apply failed (relay)"
                                 );
+                                self.adapter.mark_write_failed();
                             }
                             // The raw frame still reaches the frontend via message.stream.
                             self.forward_to_websocket(&event);
@@ -776,9 +786,23 @@ impl StreamRelay {
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "Stream relay lagged, some events dropped");
+                    self.adapter.mark_write_failed();
                 }
             }
+        };
+        if self.adapter.write_failed() && !self.is_deleting() {
+            let error = crate::runtime_completion::local_persistence_error();
+            outcome.attempt.local_persistence_failed = true;
+            outcome.attempt.terminal_error = Some(error.clone());
+            outcome.attempt.terminal_error_deferred = false;
+            outcome.terminal = RelayTerminal::Error {
+                code: error.code,
+                retryable: Some(false),
+            };
+            outcome.system_responses.clear();
+            self.forward_to_websocket(&AgentStreamEvent::Error(error));
         }
+        outcome
     }
 
     fn is_deleting(&self) -> bool {
@@ -1086,6 +1110,83 @@ mod tests {
     use tracing_subscriber::fmt;
 
     // ── run() async tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn local_sql_failures_suppress_completion_and_auto_replay() {
+        for failed_table in ["messages", "conversations"] {
+            let db = aionui_db::init_database_memory().await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
+                 VALUES ('conv-1', 'system_default_user', 'Fixture', 'acp', 1, 1)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let trigger = if failed_table == "messages" {
+                "CREATE TRIGGER fail_write BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'fixture'); END"
+            } else {
+                "CREATE TRIGGER fail_write BEFORE UPDATE ON conversations BEGIN SELECT RAISE(ABORT, 'fixture'); END"
+            };
+            sqlx::query(trigger).execute(db.pool()).await.unwrap();
+            let repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+            let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+            let mut ws = bus.subscribe();
+            let runtime = Arc::new(ConversationRuntimeStateService::default());
+            let relay = StreamRelay::new(
+                "conv-1".into(),
+                "assistant-1".into(),
+                "turn-1".into(),
+                "system_default_user".into(),
+                repo,
+                bus,
+            )
+            .with_persistence(RuntimePersistenceCoordinator::new(runtime));
+            let (tx, rx) = broadcast::channel(16);
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "answer".into(),
+            }))
+            .unwrap();
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+            let outcome = relay.consume(rx).await;
+            assert!(outcome.attempt.local_persistence_failed, "{failed_table}");
+            assert!(!outcome.attempt.safe_to_auto_replay());
+            assert!(outcome.terminal.is_error());
+            assert_eq!(outcome.terminal.code(), Some(AgentErrorCode::AionuiInternalError));
+            let mut saw_error = false;
+            while let Ok(event) = ws.try_recv() {
+                assert_ne!(event.name, "turn.completed", "{failed_table}");
+                saw_error |= event.name == "message.stream" && event.data["type"] == "error";
+                if failed_table == "messages" {
+                    assert_ne!(event.data["type"], "finish");
+                }
+            }
+            assert!(saw_error, "{failed_table}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_streaming_insert_remains_uncreated_and_marks_shared_failure() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_not_found(true);
+        let adapter = StreamPersistenceAdapter::new(
+            "user-1".into(),
+            "conv-1".into(),
+            "assistant-1".into(),
+            repo,
+            None,
+        );
+        let observer = adapter.clone();
+        let mut segment = TextSegmentState {
+            id: "segment-1".into(),
+            buffer: "answer".into(),
+            created_at: 1,
+            record_created: false,
+            flush_counter: 20,
+        };
+        adapter.flush_text_segment(&mut segment).await;
+        assert!(!segment.record_created);
+        assert!(observer.write_failed());
+    }
 
     #[derive(Clone)]
     struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
