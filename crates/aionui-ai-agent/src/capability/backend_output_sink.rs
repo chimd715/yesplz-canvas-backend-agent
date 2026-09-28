@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use aion_agent::output::OutputSink;
 use tokio::sync::broadcast;
 
@@ -8,11 +11,19 @@ use crate::protocol::events::{
 
 pub struct BackendOutputSink {
     event_tx: broadcast::Sender<AgentStreamEvent>,
+    session_save_failed: Arc<AtomicBool>,
 }
 
 impl BackendOutputSink {
     pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+        Self {
+            event_tx,
+            session_save_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn session_save_failure_flag(&self) -> Arc<AtomicBool> {
+        self.session_save_failed.clone()
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
@@ -141,6 +152,12 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_error(&self, msg: &str) {
+        // Verified against pinned aionrs v0.2.11 engine.rs::save_session.
+        // Observe the synchronous callback, even when there is no receiver or
+        // the broadcast buffer overflows. Tool-result errors use another hook.
+        if msg.starts_with("Failed to save session: ") {
+            self.session_save_failed.store(true, Ordering::Release);
+        }
         let _ = self
             .event_tx
             .send(AgentStreamEvent::Error(ErrorEventData::legacy(msg, None)));
@@ -164,6 +181,18 @@ mod tests {
     fn make_sink() -> (BackendOutputSink, broadcast::Receiver<AgentStreamEvent>) {
         let (tx, rx) = broadcast::channel(16);
         (BackendOutputSink::new(tx), rx)
+    }
+
+    #[test]
+    fn session_save_latch_distinguishes_recoverable_errors() {
+        let (sink, rx) = make_sink();
+        let failed = sink.session_save_failure_flag();
+        drop(rx);
+        sink.emit_error("Compact failed: provider temporarily unavailable");
+        sink.emit_tool_result("call", "Read", true, "File not found");
+        assert!(!failed.load(Ordering::Acquire));
+        sink.emit_error("Failed to save session: fixture disk failure");
+        assert!(failed.load(Ordering::Acquire));
     }
 
     #[test]

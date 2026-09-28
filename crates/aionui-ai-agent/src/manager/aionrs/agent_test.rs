@@ -34,7 +34,8 @@ fn make_test_config() -> AionrsResolvedConfig {
         max_tool_call_malformed_turns: None,
         max_tool_call_failure_turns: None,
         compat_overrides: Default::default(),
-        session_directory: env::temp_dir().join("aionrs-test-sessions"),
+        // Strict initialization must never reuse another test's session ID.
+        session_directory: env::temp_dir().join(format!("aionrs-test-sessions-{}", generate_short_id())),
         session_mode: None,
         skills: Vec::new(),
         extra_mcp_servers: HashMap::new(),
@@ -184,6 +185,25 @@ async fn aionrs_agent_returns_correct_type() {
     assert_eq!(agent.agent_type(), AgentType::Aionrs);
     assert_eq!(agent.workspace(), "/project");
     assert_eq!(agent.conversation_id(), "conv-1");
+}
+
+#[tokio::test]
+async fn native_session_initialization_failure_is_fatal() {
+    let directory = tempfile::tempdir().unwrap();
+    let blocked = directory.path().join("not-a-directory");
+    fs::write(&blocked, "fixture").unwrap();
+    let mut config = make_test_config();
+    config.session_directory = blocked;
+    let error = AionrsAgentManager::new(
+        "conv-init-failure".into(),
+        directory.path().to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .err()
+    .expect("A manager must not start without native persistence");
+    assert_eq!(error.public_message(), "Native session initialization failed");
 }
 
 #[tokio::test]

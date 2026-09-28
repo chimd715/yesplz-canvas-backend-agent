@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use aion_mcp::manager::McpManager;
 use aion_protocol::commands::{ApprovalScope, SessionMode};
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
 use aionui_api_types::{
-    AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentModeResponse, ConfigOptionConfirmation,
-    GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
+    AcpConfigOptionDto, AcpConfigSelectOptionDto, AgentErrorCode, AgentErrorOwnership, AgentModeResponse,
+    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse, SlashCommandItem,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationStatus, ErrorChain, TimestampMs, generate_short_id, now_ms,
@@ -37,6 +38,7 @@ use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
+use super::checkpoint::NativeCheckpointStore;
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
 
@@ -106,6 +108,8 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    session_save_failed: Arc<AtomicBool>,
+    native_checkpoints: Option<NativeCheckpointStore>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -144,7 +148,10 @@ impl AionrsAgentManager {
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
-        let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let sink = BackendOutputSink::new(runtime.event_sender());
+        let session_save_failed = sink.session_save_failure_flag();
+        let sink: Arc<dyn OutputSink> = Arc::new(sink);
+        let session_directory = config_extra.session_directory.clone();
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
@@ -236,13 +243,21 @@ impl AionrsAgentManager {
             .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
 
         let mut engine = result.engine;
-        if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
-            error!(
-                conversation_id = %conversation_id,
-                error = %ErrorChain(&*e),
-                "Failed to init session, continuing without persistence"
-            );
+        if !is_resume {
+            engine
+                .init_session(&provider_label, &workspace, Some(&conversation_id))
+                .map_err(|_| {
+                    error!(conversation_id = %conversation_id, "Native session initialization failed");
+                    AgentError::internal("Native session initialization failed")
+                })?;
         }
+        if engine.current_session_id().as_deref() != Some(conversation_id.as_str()) {
+            return Err(AgentError::internal(
+                "Native session identity does not match the conversation",
+            ));
+        }
+        let native_checkpoints = NativeCheckpointStore::configured(&session_directory)
+            .map_err(|_| AgentError::internal("Native session checkpoint storage is unavailable"))?;
 
         let approval_manager = Arc::new(ToolApprovalManager::new());
 
@@ -277,6 +292,8 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            session_save_failed,
+            native_checkpoints,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -421,7 +438,8 @@ impl IAgentTask for AionrsAgentManager {
             .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
-        engine.set_next_turn_id(Some(turn_anchor));
+        self.session_save_failed.store(false, Ordering::Release);
+        engine.set_next_turn_id(Some(turn_anchor.clone()));
 
         let result = tokio::select! {
             res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
@@ -439,7 +457,37 @@ impl IAgentTask for AionrsAgentManager {
         self.runtime.bump_activity();
 
         let send_result = match result {
-            Some(Ok(_)) => {
+            Some(Ok(result)) => {
+                let checkpoint = if self.session_save_failed.load(Ordering::Acquire) {
+                    Err(std::io::Error::other("Native session save failed"))
+                } else if let Some(store) = &self.native_checkpoints {
+                    store.capture(&engine, &result, self.runtime.conversation_id(), &turn_anchor)
+                } else {
+                    Ok(None)
+                };
+                if let Err(error) = checkpoint {
+                    error!(
+                        conversation_id = %self.runtime.conversation_id(),
+                        error_kind = ?error.kind(),
+                        "Native session persistence failed before completion"
+                    );
+                    let failure = AgentSendError::new(
+                        "Native session persistence failed",
+                        AgentErrorCode::AionuiInternalError,
+                        AgentErrorOwnership::Aionui,
+                        None,
+                        false,
+                        true,
+                        None,
+                    );
+                    self.runtime.emit_error_data(failure.stream_error().clone());
+                    self.turn_finished_notify.notify_waiters();
+                    return Err(failure);
+                }
+                if checkpoint.ok().flatten().is_some() {
+                    info!(conversation_id = %self.runtime.conversation_id(), turn_id = %turn_anchor,
+                        "Local native session checkpoint committed");
+                }
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
                     elapsed_ms,

@@ -100,9 +100,13 @@ Two integration gaps must be closed before accepting hosted turns as durable:
    Verified against commit `8e61a90329fa9f67c4fdf7e97fe02c24dba33f75`,
    [engine.rs](https://github.com/iOfficeAI/aionrs/blob/8e61a90329fa9f67c4fdf7e97fe02c24dba33f75/crates/aion-agent/src/engine.rs#L1512)
    and [session.rs](https://github.com/iOfficeAI/aionrs/blob/8e61a90329fa9f67c4fdf7e97fe02c24dba33f75/crates/aion-agent/src/session.rs#L448).
-   A supported Result-returning engine checkpoint API is required before Core
-   can acknowledge a consistent native-session checkpoint. Do not infer that a
-   streamed Finish proves the session file was saved.
+   The opt-in Linux [native checkpoint producer](../aionui-ai-agent/NATIVE_CHECKPOINTS.md)
+   now observes that synchronous save failure and validates/copies a successfully
+   completed normal turn under the engine mutex. It syncs an immutable private
+   copy and returns errors before successful completion. It does not cover
+   cancellation/slash commands or capture the complete Core/source/settings
+   boundary. A coordinator must bind and externally commit these artifacts;
+   neither a streamed Finish nor a local native checkpoint proves that happened.
 
 History currently has no pruning policy. Repeated message updates append complete
 rows and can grow the database substantially. Add checkpoint-aware retention only
