@@ -2287,6 +2287,19 @@ impl ConversationService {
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
+        // Only fork() may mint native-session lineage after checking the parent
+        // owner. Full-extra PATCH callers may echo unchanged lineage, but cannot
+        // introduce, replace or clear it while keeping the copied chat history.
+        if let Some(incoming) = req.extra.as_ref().and_then(|extra| extra.get("fork")) {
+            let persisted: serde_json::Value = serde_json::from_str(&existing.extra)
+                .map_err(|e| ConversationError::internal(format!("Invalid conversation extra JSON: {e}")))?;
+            if persisted.get("fork") != Some(incoming) {
+                return Err(ConversationError::BadRequest {
+                    reason: "extra.fork is server-managed and cannot be changed".into(),
+                });
+            }
+        }
+
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
         // conversation to produce a new snapshot.
