@@ -4,6 +4,7 @@ pub mod assistant;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
+mod conversation_outbox;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
@@ -47,6 +48,9 @@ pub use assistant::{
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
+pub use conversation_outbox::{
+    ConversationOutboxError, IConversationOutboxRepository, SqliteConversationOutboxRepository,
+};
 pub use cron::ICronRepository;
 pub use diagnostics::{
     FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,

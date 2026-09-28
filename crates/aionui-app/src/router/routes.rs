@@ -213,6 +213,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         refresh_coalescer: RefreshCoalescer::new(),
         user_repo: services.user_repo.clone(),
+        conversation_outbox: services.conversation_outbox.clone(),
         fs_adopter: Some(Arc::new(SkillFilesystemAdopter {
             skill_paths: services.skill_paths.clone(),
             skill_repo: services.skill_repo.clone(),

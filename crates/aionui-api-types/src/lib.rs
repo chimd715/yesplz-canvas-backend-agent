@@ -15,6 +15,7 @@ mod chat_file;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod conversation_outbox;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
@@ -102,6 +103,10 @@ pub use conversation::{
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
     MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+};
+pub use conversation_outbox::{
+    AcknowledgeConversationOutboxRequest, AcknowledgeConversationOutboxResponse, ConversationOutboxEvent,
+    ConversationOutboxQuery, ConversationOutboxResponse,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

@@ -54,7 +54,13 @@ const NON_CORE_USER_ID_TABLES: &[(&str, &str)] = &[
 ];
 
 /// Identity / infrastructure tables outside the ownership model.
-const INFRA_TABLES: &[&str] = &["users", "_sqlx_migrations"];
+const INFRA_TABLES: &[&str] = &[
+    "users",
+    "_sqlx_migrations",
+    // Immutable delivery history must retain its original owner after adoption.
+    "conversation_outbox",
+    "conversation_outbox_delivery",
+];
 
 async fn table_names(pool: &sqlx::SqlitePool) -> Vec<String> {
     sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")

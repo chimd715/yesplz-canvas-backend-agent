@@ -82,6 +82,7 @@ pub struct AuthRouterState {
     /// Coalesces concurrent refreshes for the same token (refresh-storm guard).
     pub refresh_coalescer: RefreshCoalescer,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub conversation_outbox: Arc<crate::service::ConversationOutboxService>,
     /// Optional on-disk adoption side-effect (AionUi → AionPro upgrade).
     pub fs_adopter: Option<Arc<dyn crate::service::SystemDefaultFilesystemAdopter>>,
     pub cookie_config: Arc<CookieConfig>,
@@ -162,7 +163,7 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     ))
 }
 
-fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+pub(crate) fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
     let Some(expected) = expected else {
         return Err(ApiError::coded(
             StatusCode::UNAUTHORIZED,
@@ -282,6 +283,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     // API rate limited public routes (no auth required)
     let api_public = Router::new()
         .route("/api/auth/status", get(status_handler))
+        .route(
+            "/api/auth/internal/conversation-outbox/{user_id}",
+            get(crate::outbox_routes::export),
+        )
+        .route(
+            "/api/auth/internal/conversation-outbox/{user_id}/ack",
+            post(crate::outbox_routes::acknowledge),
+        )
         .route(
             "/api/auth/internal/external-users/{external_user_id}",
             put(ensure_external_user_handler),

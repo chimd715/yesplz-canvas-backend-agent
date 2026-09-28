@@ -8,7 +8,9 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
-use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
+use aionui_auth::{
+    ConversationOutboxService, CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret,
+};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
@@ -64,6 +66,7 @@ pub struct AppServices {
     pub task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
+    pub conversation_outbox: Arc<ConversationOutboxService>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
     /// Raw storage-encryption secret string, used to derive the AES-256-GCM
     /// key for at-rest credentials. Decoupled from the JWT signing secret held
@@ -274,6 +277,10 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let conversation_outbox = Arc::new(ConversationOutboxService::new(
+            user_repo.clone(),
+            Arc::new(aionui_db::SqliteConversationOutboxRepository::new(database.pool().clone())),
+        ));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing
@@ -446,6 +453,7 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
+            conversation_outbox,
             acp_session_sync: acp_agent_service,
             encryption_secret_raw: encryption_secret,
             data_dir,

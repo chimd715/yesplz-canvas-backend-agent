@@ -61,6 +61,8 @@ pub async fn csrf_middleware(
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
+        // The outbox uses the same explicit server-only bootstrap credential.
+        || path.starts_with("/api/auth/internal/conversation-outbox/")
         || is_antigravity_hook
         || is_runtime_token_request;
 

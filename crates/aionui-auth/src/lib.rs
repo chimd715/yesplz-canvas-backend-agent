@@ -8,6 +8,7 @@ mod error;
 mod extract;
 mod jwt;
 pub mod middleware;
+mod outbox_routes;
 mod password;
 pub mod qr_token;
 mod rate_limit;
@@ -77,4 +78,6 @@ pub use singleflight::RefreshCoalescer;
 // Routes
 pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
 
-pub use service::{AuthProvisionService, ProvisionError, SystemDefaultFilesystemAdopter};
+pub use service::{
+    AuthProvisionService, ConversationOutboxService, OutboxServiceError, ProvisionError, SystemDefaultFilesystemAdopter,
+};

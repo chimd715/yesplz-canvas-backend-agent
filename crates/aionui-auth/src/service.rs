@@ -4,7 +4,11 @@ use aionui_api_types::{
     EnsureExternalSessionRequest, EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse,
     ExternalUserType, PublicUser, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
 };
-use aionui_db::{ExternalUserProjection, IUserRepository, UserStatus, UserType, models::User};
+use aionui_db::{
+    ConversationOutboxError, ExternalUserProjection, IConversationOutboxRepository, IUserRepository, UserStatus,
+    UserType,
+    models::{ConversationOutboxBatch, User},
+};
 
 use crate::JwtService;
 
@@ -176,5 +180,48 @@ fn external_user_response(user: User, user_type: ExternalUserType) -> EnsureExte
         user_type,
         external_user_id: user.external_user_id.unwrap_or_default(),
         session_generation: user.session_generation,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OutboxServiceError {
+    #[error("active Core user not found")]
+    UserUnavailable,
+    #[error(transparent)]
+    Db(#[from] aionui_db::DbError),
+    #[error(transparent)]
+    Outbox(#[from] ConversationOutboxError),
+}
+
+pub struct ConversationOutboxService {
+    users: Arc<dyn IUserRepository>,
+    outbox: Arc<dyn IConversationOutboxRepository>,
+}
+
+impl ConversationOutboxService {
+    pub fn new(users: Arc<dyn IUserRepository>, outbox: Arc<dyn IConversationOutboxRepository>) -> Self {
+        Self { users, outbox }
+    }
+
+    async fn require_user(&self, user_id: &str) -> Result<(), OutboxServiceError> {
+        if self.users.find_active_by_id(user_id).await?.is_none() {
+            return Err(OutboxServiceError::UserUnavailable);
+        }
+        Ok(())
+    }
+
+    pub async fn export(
+        &self,
+        user_id: &str,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> Result<ConversationOutboxBatch, OutboxServiceError> {
+        self.require_user(user_id).await?;
+        Ok(self.outbox.export(user_id, after_sequence, limit).await?)
+    }
+
+    pub async fn acknowledge(&self, user_id: &str, through_sequence: i64) -> Result<i64, OutboxServiceError> {
+        self.require_user(user_id).await?;
+        Ok(self.outbox.acknowledge(user_id, through_sequence).await?)
     }
 }

@@ -54,6 +54,10 @@ async fn test_app_with_options_and_hook(
         jwt_service: jwt_service.clone(),
         refresh_coalescer: RefreshCoalescer::new(),
         user_repo: user_repo.clone(),
+        conversation_outbox: Arc::new(aionui_auth::ConversationOutboxService::new(
+            user_repo.clone(),
+            Arc::new(aionui_db::SqliteConversationOutboxRepository::new(db.pool().clone())),
+        )),
         fs_adopter: None,
         cookie_config,
         qr_token_store: qr_token_store.clone(),
@@ -169,6 +173,94 @@ fn get_with_token(uri: &str, token: &str) -> Request<Body> {
 /// Helper: perform a GET request without auth.
 fn get_anonymous(uri: &str) -> Request<Body> {
     Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+}
+
+fn get_with_bootstrap_secret(uri: &str, secret: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("x-aioncore-bootstrap-secret", secret)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn outbox_requires_bootstrap_not_an_ordinary_user_session() {
+    let (app, ctx) = test_app_with_options(false, Some("outbox-test-secret")).await;
+    let path = "/api/auth/internal/conversation-outbox/system_default_user";
+    let token = ctx.jwt_service.sign("system_default_user", "admin").unwrap();
+    for request in [get_anonymous(path), get_with_token(path, &token)] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["code"], "BOOTSTRAP_SECRET_REQUIRED");
+    }
+    let response = app.clone().oneshot(get_with_bootstrap_secret(path, "wrong")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "INVALID_BOOTSTRAP_SECRET");
+    let response = app.oneshot(get_with_bootstrap_secret(path, "outbox-test-secret")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["data"]["schema_version"], 1);
+    assert_eq!(body["data"]["acknowledged_sequence"], 0);
+    assert_eq!(body["data"]["events"], serde_json::json!([]));
+    assert!(!body.to_string().contains("password_hash"));
+    assert!(!body.to_string().contains("outbox-test-secret"));
+}
+
+#[tokio::test]
+async fn outbox_validates_scope_input_and_explicit_header_auth_for_ack() {
+    let (app, ctx) = test_app_with_options(false, Some("outbox-test-secret")).await;
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        Arc::new(CookieConfig {
+            secure: false,
+            same_site: "Lax",
+        }),
+        aionui_auth::csrf_middleware,
+    ));
+    let path = "/api/auth/internal/conversation-outbox/system_default_user";
+    for suffix in ["?limit=0", "?after_sequence=-1", "?limit=bad", "?unknown=1"] {
+        let response = app
+            .clone()
+            .oneshot(get_with_bootstrap_secret(&format!("{path}{suffix}"), "outbox-test-secret"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let ack = format!("{path}/ack");
+    let response = app.clone().oneshot(json_post(&ack, r#"{"through_sequence":0}"#)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "BOOTSTRAP_SECRET_REQUIRED");
+    let response = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            &ack,
+            r#"{"through_sequence":0}"#,
+            "outbox-test-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK); // Explicit header auth needs no browser CSRF cookie.
+    let response = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            &ack,
+            r#"{"through_sequence":1}"#,
+            "outbox-test-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = app
+        .clone()
+        .oneshot(get_with_bootstrap_secret(
+            "/api/auth/internal/conversation-outbox/missing",
+            "outbox-test-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    ctx.user_repo.set_status("system_default_user", UserStatus::Disabled).await.unwrap();
+    let response = app.oneshot(get_with_bootstrap_secret(path, "outbox-test-secret")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 /// Helper: extract response body as JSON.

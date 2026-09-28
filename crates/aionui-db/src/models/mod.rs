@@ -5,6 +5,7 @@ mod channel;
 mod client_preference;
 mod conversation;
 mod conversation_artifact;
+mod conversation_outbox;
 mod cron_job;
 mod mcp_server;
 mod message;
@@ -31,6 +32,7 @@ pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pairi
 pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
+pub use conversation_outbox::{ConversationOutboxBatch, ConversationOutboxEvent};
 pub use cron_job::CronJobRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
