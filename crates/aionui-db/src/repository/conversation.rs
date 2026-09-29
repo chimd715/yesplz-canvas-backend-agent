@@ -7,6 +7,11 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 
+pub use super::frozen_continuation::{
+    FrozenArtifactMapping, FrozenContinuationImportResult, FrozenConversationImport, FrozenMessageMapping,
+    FrozenNativeImportBinding,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct SendRequestReceipt {
     pub client_request_id: String,
@@ -30,6 +35,36 @@ pub enum SendRequestInsert {
 /// Object-safe via `async_trait` to support `Arc<dyn IConversationRepository>`.
 #[async_trait::async_trait]
 pub trait IConversationRepository: Send + Sync {
+    /// Recover a committed import mapping after a lost response. Matching input
+    /// is required; this does not establish current native/file readiness.
+    async fn get_frozen_continuation(
+        &self,
+        _user_id: &str,
+        _params: &FrozenConversationImport,
+    ) -> Result<Option<FrozenContinuationImportResult>, DbError> {
+        Err(DbError::Init("Frozen continuation import is unsupported".into()))
+    }
+
+    /// Read-only authorization/dependency preflight before preparing native files.
+    /// The write operation repeats these checks under its writer transaction.
+    async fn validate_frozen_continuation(
+        &self,
+        _user_id: &str,
+        _params: &FrozenConversationImport,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init("Frozen continuation import is unsupported".into()))
+    }
+
+    /// Atomically import frozen rows into a fresh native continuation. This is
+    /// deliberately not an idempotent retry API: an existing destination conflicts.
+    async fn import_frozen_continuation(
+        &self,
+        _user_id: &str,
+        _params: &FrozenConversationImport,
+    ) -> Result<FrozenContinuationImportResult, DbError> {
+        Err(DbError::Init("Frozen continuation import is unsupported".into()))
+    }
+
     // ── Conversation CRUD ───────────────────────────────────────────
 
     /// Returns a conversation by user and ID, or `None` if not found.

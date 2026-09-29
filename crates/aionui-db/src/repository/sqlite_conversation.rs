@@ -8,9 +8,10 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
-    SendRequestInsert, SendRequestReceipt, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, FrozenContinuationImportResult, FrozenConversationImport,
+    IConversationRepository, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection, MessagePageParams,
+    MessagePageResult, MessageRowUpdate, MessageSearchRow, SendRequestInsert, SendRequestReceipt,
+    StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -336,6 +337,30 @@ impl SqliteConversationRepository {
 
 #[async_trait::async_trait]
 impl IConversationRepository for SqliteConversationRepository {
+    async fn get_frozen_continuation(
+        &self,
+        user_id: &str,
+        params: &FrozenConversationImport,
+    ) -> Result<Option<FrozenContinuationImportResult>, DbError> {
+        super::frozen_continuation::lookup(&self.pool, user_id, params).await
+    }
+
+    async fn validate_frozen_continuation(
+        &self,
+        user_id: &str,
+        params: &FrozenConversationImport,
+    ) -> Result<(), DbError> {
+        super::frozen_continuation::preflight(&self.pool, user_id, params).await
+    }
+
+    async fn import_frozen_continuation(
+        &self,
+        user_id: &str,
+        params: &FrozenConversationImport,
+    ) -> Result<FrozenContinuationImportResult, DbError> {
+        super::frozen_continuation::import(&self.pool, user_id, params).await
+    }
+
     // ── Conversation CRUD ───────────────────────────────────────────
 
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {

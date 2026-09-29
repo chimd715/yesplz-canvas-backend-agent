@@ -21,10 +21,19 @@ use sha2::{Digest, Sha256};
 #[path = "checkpoint_linux.rs"]
 mod filesystem;
 
+#[path = "continuation.rs"]
+mod continuation;
+pub(crate) use continuation::load_prepared_native_continuation;
+pub use continuation::{
+    FrozenNativeSession, NativeContinuationTarget, PreparedNativeContinuation, prepare_frozen_native_continuation,
+    recover_frozen_native_continuation,
+};
+
 #[cfg(target_os = "linux")]
 const MAX_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct CheckpointManifest {
     pub schema_version: u32,
     pub backend: String,

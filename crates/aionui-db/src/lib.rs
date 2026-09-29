@@ -35,9 +35,10 @@ pub use models::{
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, SendRequestInsert, SendRequestReceipt,
-    StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, FrozenArtifactMapping, FrozenContinuationImportResult,
+    FrozenConversationImport, FrozenMessageMapping, FrozenNativeImportBinding, MentionableCandidatesParams,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    SendRequestInsert, SendRequestReceipt, StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,

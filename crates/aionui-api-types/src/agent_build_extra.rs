@@ -104,6 +104,10 @@ pub struct AcpBuildExtra {
 /// Aionrs-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AionrsBuildExtra {
+    /// Trusted frozen import marker. Missing native state must never start a
+    /// fresh session or fall back to a mutable parent/workspace session.
+    #[serde(default, rename = "restoredFrom", skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<serde_json::Value>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]

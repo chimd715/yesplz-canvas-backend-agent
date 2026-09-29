@@ -22,7 +22,7 @@ use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
-use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
+use crate::manager::aionrs::{AionrsAgentManager, load_prepared_native_continuation, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
@@ -175,12 +175,22 @@ pub(super) async fn build(
 
     let session_directory = deps.data_dir.join("aionrs-sessions");
 
-    let resume_session = resolve_build_session(
-        &session_directory,
-        &ctx.workspace,
-        &ctx.conversation_id,
-        overrides.fork.as_ref(),
-    )?;
+    let resume_session = if overrides.restored_from.is_some() {
+        let mut session =
+            load_prepared_native_continuation(&session_directory, &ctx.conversation_id, &ctx.workspace)
+                .map_err(|_| AgentError::bad_request("Restored native session is unavailable; recovery is required"))?;
+        // Normal later cancellation repair still applies, but missing state
+        // never falls back to a different store or an empty native session.
+        sanitize_session_messages(&mut session.messages);
+        Some(session)
+    } else {
+        resolve_build_session(
+            &session_directory,
+            &ctx.workspace,
+            &ctx.conversation_id,
+            overrides.fork.as_ref(),
+        )?
+    };
 
     let config = AionrsResolvedConfig {
         provider,

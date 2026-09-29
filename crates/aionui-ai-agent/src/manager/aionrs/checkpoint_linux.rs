@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -186,4 +186,95 @@ impl CheckpointFiles {
         // Interrupted pending_* directories are intentionally retained and are
         // never a completed checkpoint. The coordinator selects exact turn IDs.
     }
+}
+
+/// Fresh private native-manager staging, separate from the live retention list.
+/// The pinned directories remain open across SessionManager's path-based I/O.
+pub(super) struct ContinuationFiles {
+    sessions: Directory,
+    staging: Directory,
+    _workspace: Directory,
+}
+
+pub(super) fn read_prepared_session(session_directory: &Path, conversation: &str, limit: u64) -> io::Result<Vec<u8>> {
+    Directory::root(session_directory)?
+        .child("sessions", false)?
+        .child(conversation, false)?
+        .read("state.json", limit)
+}
+
+impl ContinuationFiles {
+    pub(super) fn new(session_directory: &Path, workspace: &Path) -> io::Result<Self> {
+        let workspace = private_workspace(workspace)?;
+        let root = Directory::root(session_directory)?;
+        let sessions = root.child("sessions", false)?;
+        let staging = root
+            .child("continuations", true)?
+            .child(&format!("pending_{}", Uuid::new_v4()), true)?;
+        Ok(Self {
+            sessions,
+            staging,
+            _workspace: workspace,
+        })
+    }
+
+    pub(super) fn manager_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.staging.0.as_raw_fd()))
+    }
+
+    pub(super) fn install(&self, id: &str, bytes: &[u8], proof: &[u8]) -> io::Result<()> {
+        // Native staging may use upstream default modes; keep the publishable
+        // copy private and independently fsynced before the no-replace rename.
+        let prepared = self.staging.child("prepared", true)?;
+        prepared.write("state.json", bytes)?;
+        prepared.write("restore.json", proof)?;
+        prepared.0.sync_all()?;
+        let source = name("prepared")?;
+        let target = name(id)?;
+        // SAFETY: pinned parents and single-component names. Existing runtime
+        // sessions are never overwritten, including orphaned prior attempts.
+        if unsafe {
+            libc::renameat2(
+                self.staging.0.as_raw_fd(),
+                source.as_ptr(),
+                self.sessions.0.as_raw_fd(),
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.sessions.0.sync_all()?;
+        self.staging.0.sync_all()
+    }
+}
+
+/// Both files are read from the same pinned destination directory.
+pub(super) fn read_preparation(
+    session_directory: &Path,
+    conversation: &str,
+    workspace: &Path,
+    limit: u64,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let _workspace = private_workspace(workspace)?;
+    let prepared = Directory::root(session_directory)?
+        .child("sessions", false)?
+        .child(conversation, false)?;
+    Ok((
+        prepared.read("state.json", limit)?,
+        prepared.read("restore.json", 16 * 1024)?,
+    ))
+}
+
+fn private_workspace(path: &Path) -> io::Result<Directory> {
+    use std::os::unix::fs::MetadataExt;
+    let workspace = Directory::root(path)?;
+    if workspace.0.metadata()?.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Restored workspace is not private",
+        ));
+    }
+    Ok(workspace)
 }

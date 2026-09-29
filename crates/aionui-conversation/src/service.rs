@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[path = "frozen_continuation.rs"]
+mod frozen_continuation;
+pub use frozen_continuation::{FrozenContinuationPreparation, PreparedFrozenContinuation};
+
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
@@ -2314,13 +2318,15 @@ impl ConversationService {
         // Only fork() may mint native-session lineage after checking the parent
         // owner. Full-extra PATCH callers may echo unchanged lineage, but cannot
         // introduce, replace or clear it while keeping the copied chat history.
-        if let Some(incoming) = req.extra.as_ref().and_then(|extra| extra.get("fork")) {
-            let persisted: serde_json::Value = serde_json::from_str(&existing.extra)
-                .map_err(|e| ConversationError::internal(format!("Invalid conversation extra JSON: {e}")))?;
-            if persisted.get("fork") != Some(incoming) {
-                return Err(ConversationError::BadRequest {
-                    reason: "extra.fork is server-managed and cannot be changed".into(),
-                });
+        for key in ["fork", "restoredFrom"] {
+            if let Some(incoming) = req.extra.as_ref().and_then(|extra| extra.get(key)) {
+                let persisted: serde_json::Value = serde_json::from_str(&existing.extra)
+                    .map_err(|e| ConversationError::internal(format!("Invalid conversation extra JSON: {e}")))?;
+                if persisted.get(key) != Some(incoming) {
+                    return Err(ConversationError::BadRequest {
+                        reason: format!("extra.{key} is server-managed and cannot be changed"),
+                    });
+                }
             }
         }
 
@@ -5232,10 +5238,12 @@ fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
 /// See the call site in `create`: `extra.fork` may only be minted by the
 /// server-side fork API, never accepted from a client payload.
 fn strip_request_fork_spec(extra: &mut serde_json::Value) {
-    if let Some(obj) = extra.as_object_mut()
-        && obj.remove("fork").is_some()
-    {
-        warn!("create: stripped client-supplied `extra.fork` (server-minted only)");
+    if let Some(obj) = extra.as_object_mut() {
+        for key in ["fork", "restoredFrom"] {
+            if obj.remove(key).is_some() {
+                warn!(field = key, "create: stripped client-supplied server-owned lineage");
+            }
+        }
     }
 }
 

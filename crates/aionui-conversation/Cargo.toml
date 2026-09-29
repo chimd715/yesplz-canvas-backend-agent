@@ -27,6 +27,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+aion-agent.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 tempfile.workspace = true

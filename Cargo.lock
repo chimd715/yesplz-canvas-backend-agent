@@ -577,6 +577,7 @@ dependencies = [
 name = "aionui-conversation"
 version = "0.2.2"
 dependencies = [
+ "aion-agent",
  "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",
@@ -644,6 +645,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",

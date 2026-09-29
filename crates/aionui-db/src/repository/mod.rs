@@ -8,6 +8,7 @@ mod conversation_outbox;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
+mod frozen_continuation;
 pub mod mcp_server;
 pub mod oauth_token;
 pub mod project;

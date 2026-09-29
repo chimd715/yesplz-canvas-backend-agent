@@ -61,6 +61,7 @@ const INFRA_TABLES: &[&str] = &[
     "conversation_outbox",
     "conversation_outbox_delivery",
     "conversation_send_receipts", // Immutable request owner, not adopted historical identity.
+    "frozen_continuation_imports", // Immutable import owner and copy mapping.
 ];
 
 async fn table_names(pool: &sqlx::SqlitePool) -> Vec<String> {

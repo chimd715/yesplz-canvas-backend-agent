@@ -60,6 +60,10 @@ mod acp_error_recovery_test;
 #[path = "service_test/send_receipts_test.rs"]
 mod send_receipts_test;
 
+#[cfg(target_os = "linux")]
+#[path = "service_test/frozen_continuation_test.rs"]
+mod frozen_continuation_test;
+
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
@@ -8964,80 +8968,85 @@ async fn update_rejects_request_fork_spec_without_changing_existing_lineage() {
         "parent_session_id": "owned-session",
         "last_turn_id": "owned-turn"
     });
-    for existing_fork in [None, Some(lineage.clone())] {
-        let conv = svc.create("owner", make_create_req()).await.unwrap();
-        if let Some(fork) = existing_fork {
-            // Seed metadata as the trusted fork operation does, not through PATCH.
-            let mut extra = conv.extra.clone();
-            extra["fork"] = fork;
-            repo.update(
-                "owner",
-                &conv.id,
-                &ConversationRowUpdate {
-                    extra: Some(extra.to_string()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        }
-        let before = get_row(&repo, "owner", &conv.id).await;
-        broadcaster.take_events();
-        for value in [
-            json!({ "parent_conversation_id": "foreign-parent", "parent_session_id": "foreign-session" }),
-            json!({ "last_turn_id": "different-turn" }),
-            json!(null),
-            json!("invalid"),
-        ] {
-            let req = serde_json::from_value(json!({ "name": "must not change", "extra": { "fork": value } })).unwrap();
-            let error = svc.update("owner", &conv.id, req, &task_mgr).await.unwrap_err();
-            assert!(matches!(error, ConversationError::BadRequest { reason }
-                if reason == "extra.fork is server-managed and cannot be changed"));
-            let after = get_row(&repo, "owner", &conv.id).await;
-            assert_eq!(after.extra, before.extra);
-            assert_eq!(after.name, before.name);
-            assert!(broadcaster.take_events().is_empty());
-        }
+    for key in ["fork", "restoredFrom"] {
+        for existing_fork in [None, Some(lineage.clone())] {
+            let conv = svc.create("owner", make_create_req()).await.unwrap();
+            if let Some(fork) = existing_fork {
+                // Seed metadata as the trusted fork operation does, not through PATCH.
+                let mut extra = conv.extra.clone();
+                extra[key] = fork;
+                repo.update(
+                    "owner",
+                    &conv.id,
+                    &ConversationRowUpdate {
+                        extra: Some(extra.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let before = get_row(&repo, "owner", &conv.id).await;
+            broadcaster.take_events();
+            for value in [
+                json!({ "parent_conversation_id": "foreign-parent", "parent_session_id": "foreign-session" }),
+                json!({ "last_turn_id": "different-turn" }),
+                json!(null),
+                json!("invalid"),
+            ] {
+                let req =
+                    serde_json::from_value(json!({ "name": "must not change", "extra": { (key): value } })).unwrap();
+                let error = svc.update("owner", &conv.id, req, &task_mgr).await.unwrap_err();
+                assert!(matches!(error, ConversationError::BadRequest { reason }
+                if reason == format!("extra.{key} is server-managed and cannot be changed")));
+                let after = get_row(&repo, "owner", &conv.id).await;
+                assert_eq!(after.extra, before.extra);
+                assert_eq!(after.name, before.name);
+                assert!(broadcaster.take_events().is_empty());
+            }
 
-        let req = serde_json::from_value(json!({ "extra": { "display_density": "compact" } })).unwrap();
-        let updated = svc.update("owner", &conv.id, req, &task_mgr).await.unwrap();
-        let original: serde_json::Value = serde_json::from_str(&before.extra).unwrap();
-        assert_eq!(updated.extra.get("fork"), original.get("fork"));
-        assert_eq!(updated.extra["display_density"], "compact");
-
-        if let Some(fork) = original.get("fork") {
-            let req = serde_json::from_value(json!({
-                "extra": { "fork": fork, "display_density": "comfortable" }
-            }))
-            .unwrap();
+            let req = serde_json::from_value(json!({ "extra": { "display_density": "compact" } })).unwrap();
             let updated = svc.update("owner", &conv.id, req, &task_mgr).await.unwrap();
-            assert_eq!(updated.extra.get("fork"), Some(fork));
-            assert_eq!(updated.extra["display_density"], "comfortable");
-        }
+            let original: serde_json::Value = serde_json::from_str(&before.extra).unwrap();
+            assert_eq!(updated.extra.get(key), original.get(key));
+            assert_eq!(updated.extra["display_density"], "compact");
 
-        let req = serde_json::from_value(json!({ "extra": { "fork": null } })).unwrap();
-        let error = svc.update("other-owner", &conv.id, req, &task_mgr).await.unwrap_err();
-        assert!(matches!(error, ConversationError::NotFound { .. }));
+            if let Some(fork) = original.get(key) {
+                let req = serde_json::from_value(json!({
+                    "extra": { (key): fork, "display_density": "comfortable" }
+                }))
+                .unwrap();
+                let updated = svc.update("owner", &conv.id, req, &task_mgr).await.unwrap();
+                assert_eq!(updated.extra.get(key), Some(fork));
+                assert_eq!(updated.extra["display_density"], "comfortable");
+            }
+
+            let req = serde_json::from_value(json!({ "extra": { (key): null } })).unwrap();
+            let error = svc.update("other-owner", &conv.id, req, &task_mgr).await.unwrap_err();
+            assert!(matches!(error, ConversationError::NotFound { .. }));
+        }
     }
 }
 
 #[tokio::test]
 async fn create_and_clone_strip_request_fork_spec() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
-    for clone in [false, true] {
-        let mut request = make_create_req();
-        request.extra["fork"] = json!({ "parent_session_id": "foreign-session" });
-        let response = if clone {
-            svc.clone_create("owner", CloneConversationRequest { conversation: request })
-                .await
-                .unwrap()
-        } else {
-            svc.create("owner", request).await.unwrap()
-        };
-        assert!(response.extra.get("fork").is_none());
-        let row = get_row(&repo, "owner", &response.id).await;
-        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        assert!(extra.get("fork").is_none());
+    for key in ["fork", "restoredFrom"] {
+        for clone in [false, true] {
+            let mut request = make_create_req();
+            request.extra[key] = json!({ "parent_session_id": "foreign-session" });
+            let response = if clone {
+                svc.clone_create("owner", CloneConversationRequest { conversation: request })
+                    .await
+                    .unwrap()
+            } else {
+                svc.create("owner", request).await.unwrap()
+            };
+            assert!(response.extra.get(key).is_none());
+            let row = get_row(&repo, "owner", &response.id).await;
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+            assert!(extra.get(key).is_none());
+        }
     }
 }
 

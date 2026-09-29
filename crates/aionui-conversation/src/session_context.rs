@@ -199,9 +199,20 @@ impl<'a> SessionContextBuilder<'a> {
                 .build_acp_context(row, extra, team)
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
-            AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
-                row, extra, team, seed,
-            )))),
+            AgentType::Aionrs => {
+                // A malformed restored envelope must not lose its strict native
+                // resume marker through the legacy default-config fallback.
+                if extra.get("restoredFrom").is_some() {
+                    serde_json::from_value::<AionrsBuildExtra>(extra.clone()).map_err(|_| {
+                        ConversationError::BadRequest {
+                            reason: "Invalid restored native build options".into(),
+                        }
+                    })?;
+                }
+                Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(
+                    row, extra, team, seed,
+                ))))
+            }
             // Antigravity reuses the ACP build context's SHAPE (a CLI agent with
             // a workspace, MCP servers, skills and a resume anchor) but never the
             // ACP factory: agy does not speak ACP.
