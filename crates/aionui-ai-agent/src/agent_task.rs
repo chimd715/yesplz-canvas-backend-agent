@@ -372,11 +372,10 @@ impl AgentInstance {
         answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
     ) -> Result<(), AgentError> {
         match self {
-            // Only the direct-CLI session path has a question channel today
-            // (claude AskUserQuestion); ACP/aionrs have none to answer on.
-            Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::BadRequest(
+            Self::Acp(_) => Err(AgentError::BadRequest(
                 "answer_ask is not supported by this agent".into(),
             )),
+            Self::Aionrs(m) => m.answer_ask(request_id, answers),
             Self::Session(m) => m.answer_ask(request_id, answers),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.answer_ask(request_id, answers),

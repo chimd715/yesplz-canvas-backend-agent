@@ -41,6 +41,7 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 use super::checkpoint::NativeCheckpointStore;
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::questions::NativeQuestions;
 
 fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
@@ -122,6 +123,7 @@ pub struct AionrsAgentManager {
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
+    questions: Arc<NativeQuestions>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
@@ -208,6 +210,11 @@ impl AionrsAgentManager {
         config.session.enabled = true;
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
         config.compat.image_input = Some(image_input_capability);
+        // Product questions require an answer, not a separate permission to ask.
+        config
+            .tools
+            .allow_list
+            .extend(["AskUserQuestion".to_owned(), "ConfirmWidgetData".to_owned()]);
 
         if let Some(mode) = config_extra.compat_overrides.openai_api_mode {
             config.compat.transport.openai_api_mode = Some(mode);
@@ -226,6 +233,13 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let questions = NativeQuestions::new(
+            conversation_id.clone(),
+            runtime.event_sender(),
+            confirmations.clone(),
+            resume_session.as_ref(),
+        );
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
         if let Some(session) = resume_session {
             info!(
@@ -243,6 +257,7 @@ impl AionrsAgentManager {
             .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
 
         let mut engine = result.engine;
+        questions.register(engine.registry_mut());
         if !is_resume {
             engine
                 .init_session(&provider_label, &workspace, Some(&conversation_id))
@@ -271,7 +286,6 @@ impl AionrsAgentManager {
             );
         }
 
-        let confirmations = Arc::new(RwLock::new(Vec::new()));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
@@ -298,6 +312,7 @@ impl AionrsAgentManager {
             mcp_managers: result.mcp_managers,
             approval_manager,
             confirmations,
+            questions,
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
@@ -306,6 +321,7 @@ impl AionrsAgentManager {
 
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
         let was_running = self.runtime.status() == Some(ConversationStatus::Running);
+        self.questions.cancel();
 
         if let Ok(mut confs) = self.confirmations.write() {
             confs.clear();
@@ -409,6 +425,7 @@ impl IAgentTask for AionrsAgentManager {
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        self.questions.observe_input(&data.content);
         self.dump_aionrs_final_input(&data);
 
         // Keep attachment paths in the provider-independent history. Images
@@ -608,6 +625,14 @@ impl AionrsAgentManager {
 
     pub fn get_confirmations(&self) -> Vec<Confirmation> {
         self.confirmations.read().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        self.questions.answer(request_id, answers)
     }
 
     pub fn check_approval(&self, action: &str, _command_type: Option<&str>) -> bool {

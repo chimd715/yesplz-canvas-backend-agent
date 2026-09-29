@@ -1,6 +1,7 @@
 mod checkpoint;
 mod content;
 mod error;
+mod questions;
 
 pub mod agent;
 pub mod history_sanitize;
