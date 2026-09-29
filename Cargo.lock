@@ -399,6 +399,7 @@ dependencies = [
 name = "aionui-app"
 version = "0.2.2"
 dependencies = [
+ "aion-agent",
  "aion-config",
  "aionui-ai-agent",
  "aionui-api-types",

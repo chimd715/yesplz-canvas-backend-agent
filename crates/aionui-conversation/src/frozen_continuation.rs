@@ -1,4 +1,4 @@
-//! Trusted archive import, intentionally not registered as an HTTP route.
+//! Trusted archive import without activating the restored conversation.
 use super::*;
 use aionui_ai_agent::manager::aionrs::{
     FrozenNativeSession, NativeContinuationTarget, PreparedNativeContinuation, prepare_frozen_native_continuation,
@@ -31,8 +31,49 @@ impl ConversationService {
         native_session_directory: &Path,
         input: FrozenContinuationPreparation,
     ) -> Result<PreparedFrozenContinuation, ConversationError> {
+        self.frozen_continuation(
+            user_id,
+            expected_runtime_build_sha256,
+            native_session_directory,
+            input,
+            false,
+        )
+        .await
+    }
+
+    /// Read only: a missing committed import never falls back to preparation.
+    pub async fn recover_frozen_continuation(
+        &self,
+        user_id: &str,
+        expected_runtime_build_sha256: &str,
+        native_session_directory: &Path,
+        input: FrozenContinuationPreparation,
+    ) -> Result<PreparedFrozenContinuation, ConversationError> {
+        self.frozen_continuation(
+            user_id,
+            expected_runtime_build_sha256,
+            native_session_directory,
+            input,
+            true,
+        )
+        .await
+    }
+
+    async fn frozen_continuation(
+        &self,
+        user_id: &str,
+        expected_runtime_build_sha256: &str,
+        native_session_directory: &Path,
+        input: FrozenContinuationPreparation,
+        read_only: bool,
+    ) -> Result<PreparedFrozenContinuation, ConversationError> {
         let rows = input.rows;
-        rows.validate(user_id)?;
+        rows.validate(user_id).map_err(|error| match error {
+            aionui_db::DbError::Init(_) => ConversationError::BadRequest {
+                reason: "Invalid frozen continuation rows".into(),
+            },
+            error => error.into(),
+        })?;
         use sha2::{Digest, Sha256};
         if serde_json::to_vec(&rows)
             .map_err(|_| ConversationError::internal("Frozen import serialization failed"))?
@@ -55,6 +96,11 @@ impl ConversationService {
             });
         }
         let committed = self.conversation_repo.get_frozen_continuation(user_id, &rows).await?;
+        if read_only && committed.is_none() {
+            return Err(ConversationError::NotFoundReason {
+                reason: "Frozen continuation has not been prepared".into(),
+            });
+        }
         // Authorization/dependency checks precede filesystem preparation and
         // repeat inside the final SQLite transaction to reject races.
         if committed.is_none() {

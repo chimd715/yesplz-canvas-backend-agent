@@ -28,7 +28,8 @@ use aionui_channel::channel_routes;
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{
-    ConversationRuntimeRouterState, conversation_ops_routes, conversation_routes, conversation_runtime_routes,
+    ConversationRuntimeRouterState, FrozenContinuationRouterState, conversation_ops_routes, conversation_routes,
+    conversation_runtime_routes, frozen_continuation_routes,
 };
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
@@ -285,6 +286,23 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let conversation_authenticated = conversation_routes(states.conversation.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Internal archive authority requires both the bootstrap credential and a
+    // current JWT session. Do not inherit the runtime helper fallback.
+    let frozen_continuation_authenticated = frozen_continuation_routes(FrozenContinuationRouterState {
+        service: services.conversation_service.clone(),
+        bootstrap_secret: services.bootstrap_secret.clone(),
+        runtime_build_sha256: services.frozen_continuation_build_sha256.clone(),
+        native_session_directory: services.data_dir.join("aionrs-sessions"),
+        identity_mode: auth_identity_mode(services.identity_mode),
+    })
+    .route_layer(from_fn_with_state(
+        AuthState {
+            runtime_token_verifier: None,
+            ..auth_mw_state.clone()
+        },
+        auth_middleware,
+    ));
+
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
@@ -403,6 +421,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
+        .merge(frozen_continuation_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)

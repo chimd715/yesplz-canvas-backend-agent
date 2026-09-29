@@ -29,6 +29,24 @@ fn opened(fd: libc::c_int) -> io::Result<File> {
 }
 
 impl Directory {
+    fn root_or_create_last(path: &Path) -> io::Result<Self> {
+        match Self::root(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Native session parent is required"))?;
+                let child = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid native session directory"))?;
+                // Only the final configured component may be missing. Pin its
+                // existing parent and never follow a symlink during creation.
+                Self::root(parent)?.child(child, true)
+            }
+            result => result,
+        }
+    }
+
     fn root(path: &Path) -> io::Result<Self> {
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -206,8 +224,11 @@ pub(super) fn read_prepared_session(session_directory: &Path, conversation: &str
 impl ContinuationFiles {
     pub(super) fn new(session_directory: &Path, workspace: &Path) -> io::Result<Self> {
         let workspace = private_workspace(workspace)?;
-        let root = Directory::root(session_directory)?;
-        let sessions = root.child("sessions", false)?;
+        let root = Directory::root_or_create_last(session_directory)?;
+        let sessions = match root.child("sessions", false) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => root.child("sessions", true)?,
+            result => result?,
+        };
         let staging = root
             .child("continuations", true)?
             .child(&format!("pending_{}", Uuid::new_v4()), true)?;

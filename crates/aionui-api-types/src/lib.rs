@@ -21,6 +21,7 @@ mod cron;
 mod custom_agent;
 mod extension;
 mod file;
+mod frozen_continuation;
 mod lifecycle;
 mod mcp;
 mod office;
@@ -245,3 +246,9 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub use frozen_continuation::{
+    FrozenArtifactMappingResponse, FrozenContinuationImportResponse, FrozenContinuationRequest,
+    FrozenContinuationResponse, FrozenMessageMappingResponse, FrozenNativeSessionRequest,
+    PreparedNativeContinuationResponse,
+};

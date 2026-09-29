@@ -163,7 +163,7 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     ))
 }
 
-pub(crate) fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
+pub fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
     let Some(expected) = expected else {
         return Err(ApiError::coded(
             StatusCode::UNAUTHORIZED,

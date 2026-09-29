@@ -161,6 +161,12 @@ async fn frozen_continuation_prepares_real_native_and_sqlite_then_recovers_exact
     let events = Arc::new(MockBroadcaster::new());
     let svc = service(workspace.path(), repo.clone(), events.clone());
     let request = input(source.path(), workspace.path());
+    let missing = svc
+        .recover_frozen_continuation(OWNER, &"a".repeat(64), sessions.path(), request.clone())
+        .await;
+    assert!(matches!(missing, Err(ConversationError::NotFoundReason { .. })));
+    assert!(!sessions.path().join("sessions/continuation").exists());
+    assert!(repo.get(OWNER, "continuation").await.unwrap().is_none());
     // There is deliberately no mutable parent conversation or session to read.
     let prepared = svc
         .prepare_frozen_continuation(OWNER, &"a".repeat(64), sessions.path(), request.clone())
@@ -195,7 +201,7 @@ async fn frozen_continuation_prepares_real_native_and_sqlite_then_recovers_exact
         .unwrap();
     let restarted = service(workspace.path(), repo.clone(), events.clone());
     let recovered = restarted
-        .prepare_frozen_continuation(OWNER, &"a".repeat(64), sessions.path(), request.clone())
+        .recover_frozen_continuation(OWNER, &"a".repeat(64), sessions.path(), request.clone())
         .await
         .unwrap();
     assert_eq!(recovered.imported, prepared.imported);

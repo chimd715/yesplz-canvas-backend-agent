@@ -81,3 +81,6 @@ pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
 pub use service::{
     AuthProvisionService, ConversationOutboxService, OutboxServiceError, ProvisionError, SystemDefaultFilesystemAdopter,
 };
+
+// Shared server-only control route guard.
+pub use routes::require_bootstrap_secret;

@@ -79,6 +79,9 @@ pub struct AppServices {
     pub local: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
+    /// Digest of the running executable, captured once. Never read from request
+    /// input, environment configuration, or the overridable helper binary path.
+    pub frozen_continuation_build_sha256: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -279,7 +282,9 @@ impl AppServices {
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let conversation_outbox = Arc::new(ConversationOutboxService::new(
             user_repo.clone(),
-            Arc::new(aionui_db::SqliteConversationOutboxRepository::new(database.pool().clone())),
+            Arc::new(aionui_db::SqliteConversationOutboxRepository::new(
+                database.pool().clone(),
+            )),
         ));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
@@ -462,6 +467,11 @@ impl AppServices {
             local,
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
+            frozen_continuation_build_sha256: if config.bootstrap_secret.is_some() && !identity_mode.is_local() {
+                running_executable_sha256()
+            } else {
+                None
+            },
             app_version,
             skill_paths,
             skill_repo,
@@ -470,6 +480,45 @@ impl AppServices {
             runtime_base_url,
         })
     }
+}
+
+/// Linux exposes the running executable inode even if its original path has
+/// been replaced. Unsupported platforms and read errors disable this control API.
+fn running_executable_sha256() -> Option<Arc<str>> {
+    static DIGEST: std::sync::OnceLock<Option<Arc<str>>> = std::sync::OnceLock::new();
+    DIGEST
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                use sha2::{Digest, Sha256};
+                use std::io::Read;
+                let result = (|| -> std::io::Result<Arc<str>> {
+                    let mut executable = std::fs::File::open("/proc/self/exe")?;
+                    let mut hasher = Sha256::new();
+                    let mut bytes = [0_u8; 64 * 1024];
+                    loop {
+                        let read = executable.read(&mut bytes)?;
+                        if read == 0 {
+                            break;
+                        }
+                        hasher.update(&bytes[..read]);
+                    }
+                    Ok(Arc::from(format!("{:x}", hasher.finalize())))
+                })();
+                match result {
+                    Ok(digest) => Some(digest),
+                    Err(error) => {
+                        tracing::warn!(error_kind = ?error.kind(), "Running native build identity unavailable");
+                        None
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        })
+        .clone()
 }
 
 struct ConversationServiceDeps<'a> {
