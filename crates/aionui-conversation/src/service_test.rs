@@ -57,6 +57,9 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
 
+#[path = "service_test/send_receipts_test.rs"]
+mod send_receipts_test;
+
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
@@ -6035,6 +6038,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
             "user_1",
             &conv.id,
             SendMessageRequest {
+                client_request_id: None,
                 content: "hello".into(),
                 hidden: false,
                 files: vec![],

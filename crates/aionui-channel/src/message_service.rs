@@ -72,6 +72,7 @@ impl ChannelMessageService {
         // correlate the user message back to the conversation should use
         // `conversation_id` + stream events instead of a client-provided id.
         let req = SendMessageRequest {
+            client_request_id: None,
             content: text.to_owned(),
             files: vec![],
             // Channel traffic has no `@@` picker, so never any session refs.

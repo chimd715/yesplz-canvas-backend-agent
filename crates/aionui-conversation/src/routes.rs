@@ -122,6 +122,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
+        .route(
+            "/api/conversations/{id}/requests/{client_request_id}",
+            get(get_send_request),
+        )
         // MUST precede the `{messageId}` wildcard below: registered after it,
         // "latest" would be captured as a message id and 404.
         .route("/api/conversations/{id}/messages/latest", get(latest_msg))
@@ -296,6 +300,19 @@ async fn get_msg(
     let result = state
         .service
         .get_message(&user.id, &params.id, &params.message_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn get_send_request(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((id, client_request_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<SendMessageResponse>>, ApiError> {
+    let result = state
+        .service
+        .get_send_request(&user.id, &id, &client_request_id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

@@ -178,6 +178,10 @@ pub struct SessionRef {
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
     pub content: String,
+    /// Optional immutable key for a native Aionrs normal send. Retries return
+    /// its original message/turn IDs without repeating execution.
+    #[serde(default)]
+    pub client_request_id: Option<String>,
     #[serde(default)]
     pub files: Vec<ChatFileRef>,
     /// Conversations the user referenced with `@@`. Resolved at the send
@@ -193,6 +197,9 @@ pub struct SendMessageRequest {
 /// Response for `POST /api/conversations/:id/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {
+    /// Present only when a durable native request receipt was committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
     pub msg_id: String,
     pub turn_id: String,
     /// B5 mid-turn interjection: `true` when the message was delivered INTO the

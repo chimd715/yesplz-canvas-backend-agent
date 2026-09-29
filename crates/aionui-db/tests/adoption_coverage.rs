@@ -60,6 +60,7 @@ const INFRA_TABLES: &[&str] = &[
     // Immutable delivery history must retain its original owner after adoption.
     "conversation_outbox",
     "conversation_outbox_delivery",
+    "conversation_send_receipts", // Immutable request owner, not adopted historical identity.
 ];
 
 async fn table_names(pool: &sqlx::SqlitePool) -> Vec<String> {

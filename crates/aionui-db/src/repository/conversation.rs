@@ -7,6 +7,20 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct SendRequestReceipt {
+    pub client_request_id: String,
+    pub payload_sha256: String,
+    pub msg_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendRequestInsert {
+    Inserted,
+    Existing(SendRequestReceipt),
+}
+
 /// Conversation + message data access abstraction.
 ///
 /// Covers conversation CRUD, extended queries (source/chat, cron-job,
@@ -153,6 +167,32 @@ pub trait IConversationRepository: Send + Sync {
 
     /// Inserts a new message row.
     async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError>;
+
+    /// Look up only an accepted request belonging to this current conversation
+    /// owner. Unsupported repositories must not silently promise idempotence.
+    async fn get_send_receipt(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _client_request_id: &str,
+    ) -> Result<Option<SendRequestReceipt>, DbError> {
+        Err(DbError::Init(
+            "Send request receipts are not supported by this repository".into(),
+        ))
+    }
+
+    /// Commit the receipt, user message and recency/outbox changes atomically.
+    /// Existing means the caller MUST NOT broadcast or dispatch another turn.
+    async fn insert_message_with_receipt(
+        &self,
+        _user_id: &str,
+        _message: &MessageRow,
+        _receipt: &SendRequestReceipt,
+    ) -> Result<SendRequestInsert, DbError> {
+        Err(DbError::Init(
+            "Send request receipts are not supported by this repository".into(),
+        ))
+    }
 
     /// Inserts a message row, or merges mutable fields into the existing row with the same ID.
     async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {

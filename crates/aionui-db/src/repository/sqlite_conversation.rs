@@ -10,7 +10,7 @@ use crate::models::{
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
     MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
-    StaleRuntimeMessageRow,
+    SendRequestInsert, SendRequestReceipt, StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -50,28 +50,55 @@ impl SqliteConversationRepository {
         }
     }
 
-    async fn insert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+    async fn insert_message_once(
+        &self,
+        user_id: &str,
+        message: &MessageRow,
+        receipt: Option<&SendRequestReceipt>,
+    ) -> Result<SendRequestInsert, DbError> {
         // BEGIN IMMEDIATE claims the writer lock up front (same pattern as
         // `claim_run`) so concurrent inserters queue on SQLite's busy handler
         // instead of a read-then-write transaction failing with "database is
         // locked" when it tries to upgrade to the write lock.
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        // SQLx rolls back on cancellation/drop as well as explicit errors.
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        let result: Result<(), DbError> = async {
+        let result: Result<SendRequestInsert, DbError> = async {
             // Ownership check inside the same transaction as the insert +
             // bump, so parent-chain authorization and the write are atomic.
             let exists: i64 =
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
                     .bind(user_id)
                     .bind(&message.conversation_id)
-                    .fetch_one(&mut *connection)
+                    .fetch_one(&mut *transaction)
                     .await?;
             if exists == 0 {
                 return Err(DbError::NotFound(format!(
                     "Conversation '{}' not found",
                     message.conversation_id
                 )));
+            }
+            if let Some(receipt) = receipt {
+                if message.id != receipt.msg_id || message.msg_id.as_deref() != Some(receipt.msg_id.as_str()) {
+                    return Err(DbError::Init("Send receipt does not match its user message".into()));
+                }
+                let existing = sqlx::query_as::<_, SendRequestReceipt>(
+                    "SELECT client_request_id, payload_sha256, msg_id, turn_id FROM conversation_send_receipts \
+                     WHERE subject_id = ? AND conversation_id = ? AND client_request_id = ?",
+                )
+                .bind(user_id)
+                .bind(&message.conversation_id)
+                .bind(&receipt.client_request_id)
+                .fetch_optional(&mut *transaction)
+                .await?;
+                if let Some(existing) = existing {
+                    if existing.payload_sha256 != receipt.payload_sha256 {
+                        return Err(DbError::Conflict(
+                            "client_request_id already accepted with another payload".into(),
+                        ));
+                    }
+                    return Ok(SendRequestInsert::Existing(existing));
+                }
             }
             sqlx::query(
                 "INSERT INTO messages \
@@ -89,8 +116,25 @@ impl SqliteConversationRepository {
             .bind(message.hidden)
             .bind(message.created_at)
             .bind(&message.backend_turn_id)
-            .execute(&mut *connection)
+            .execute(&mut *transaction)
             .await?;
+
+            if let Some(receipt) = receipt {
+                sqlx::query(
+                    "INSERT INTO conversation_send_receipts \
+                     (subject_id, conversation_id, client_request_id, payload_sha256, msg_id, turn_id, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(user_id)
+                .bind(&message.conversation_id)
+                .bind(&receipt.client_request_id)
+                .bind(&receipt.payload_sha256)
+                .bind(&receipt.msg_id)
+                .bind(&receipt.turn_id)
+                .bind(message.created_at)
+                .execute(&mut *transaction)
+                .await?;
+            }
 
             // Persisting a message bumps the parent conversation's recency so
             // the conversation-list sort floats fresh activity to the top;
@@ -98,19 +142,19 @@ impl SqliteConversationRepository {
             sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
                 .bind(message.created_at)
                 .bind(&message.conversation_id)
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
-            Ok(())
+            Ok(SendRequestInsert::Inserted)
         }
         .await;
 
         match result {
-            Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *connection).await?;
-                Ok(())
+            Ok(outcome) => {
+                transaction.commit().await?;
+                Ok(outcome)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -967,7 +1011,34 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
-        self.insert_message_once(user_id, message).await
+        self.insert_message_once(user_id, message, None).await.map(|_| ())
+    }
+
+    async fn get_send_receipt(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+    ) -> Result<Option<SendRequestReceipt>, DbError> {
+        Ok(sqlx::query_as::<_, SendRequestReceipt>(
+            "SELECT r.client_request_id, r.payload_sha256, r.msg_id, r.turn_id FROM conversation_send_receipts r \
+             JOIN conversations c ON c.id = r.conversation_id AND c.user_id = r.subject_id \
+             WHERE r.subject_id = ? AND r.conversation_id = ? AND r.client_request_id = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(client_request_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    async fn insert_message_with_receipt(
+        &self,
+        user_id: &str,
+        message: &MessageRow,
+        receipt: &SendRequestReceipt,
+    ) -> Result<SendRequestInsert, DbError> {
+        self.insert_message_once(user_id, message, Some(receipt)).await
     }
 
     async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {

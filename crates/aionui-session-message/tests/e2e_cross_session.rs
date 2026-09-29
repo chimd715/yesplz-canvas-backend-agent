@@ -199,6 +199,7 @@ async fn the_send_message_team_guard_cannot_be_bypassed_by_calling_the_layer_bel
             USER,
             &team_conv.id,
             SendMessageRequest {
+                client_request_id: None,
                 content: "straight at the bottom layer".to_owned(),
                 files: Vec::new(),
                 sessions: Vec::new(),

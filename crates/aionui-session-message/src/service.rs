@@ -354,6 +354,7 @@ impl SessionMessageService {
         content: String,
     ) -> Result<SendMessageResponse, DeliverAttemptError> {
         let request = SendMessageRequest {
+            client_request_id: None,
             content,
             files: Vec::new(),
             // The delivered body is already fully composed; `@@` resolution is

@@ -40,8 +40,8 @@ use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
-    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, SendRequestInsert,
+    SendRequestReceipt, UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -49,6 +49,7 @@ use aionui_project::{ProjectService, ResolvedChatMessage, canonical};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -290,6 +291,23 @@ fn parse_agent_type_from_row(row: &ConversationRow) -> Option<AgentType> {
     serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok()
 }
 
+fn validate_send_request_id(row: &ConversationRow, request_id: &str) -> Result<(), ConversationError> {
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ConversationError::bad_request("Invalid client_request_id"));
+    }
+    if parse_agent_type_from_row(row) != Some(AgentType::Aionrs) {
+        return Err(ConversationError::Unprocessable {
+            reason: "client_request_id is only supported for native Aionrs sends".into(),
+        });
+    }
+    Ok(())
+}
+
 fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), ConversationError> {
     let Some(agent_type) = parse_agent_type_from_row(row) else {
         return Ok(());
@@ -338,6 +356,9 @@ pub struct ConversationService {
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    // ponytail: serialize ID-bearing admission until its receipt commits; use
+    // per-conversation locks if attachment resolution limits send throughput.
+    send_admission: Arc<tokio::sync::Mutex<()>>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
@@ -422,6 +443,7 @@ impl ConversationService {
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            send_admission: Arc::new(tokio::sync::Mutex::new(())),
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
@@ -917,8 +939,10 @@ impl ConversationService {
         conversation_id: &str,
         msg_id: String,
         turn_id: String,
+        client_request_id: Option<String>,
     ) -> SendMessageResponse {
         SendMessageResponse {
+            client_request_id,
             msg_id,
             turn_id,
             delivered_midturn: false,
@@ -3752,7 +3776,7 @@ impl ConversationService {
                     "mid-turn message delivered into the active turn"
                 );
                 let mut response = self
-                    .send_message_response(conversation_id, user_msg_id, active_turn_id)
+                    .send_message_response(conversation_id, user_msg_id, active_turn_id, None)
                     .await;
                 response.delivered_midturn = true;
                 Ok(MidturnOutcome::Delivered(response))
@@ -3809,12 +3833,42 @@ impl ConversationService {
                 self.persist_and_broadcast_send_failure_tip(user_id, conversation_id, &active_turn_id, &e, None)
                     .await;
                 Ok(MidturnOutcome::Delivered(
-                    self.send_message_response(conversation_id, user_msg_id, active_turn_id)
+                    self.send_message_response(conversation_id, user_msg_id, active_turn_id, None)
                         .await,
                 ))
             }
         }
     }
+    /// Reconcile acceptance without ever creating or resuming an agent task.
+    pub async fn get_send_request(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        validate_send_request_id(&row, client_request_id)?;
+        let receipt = self
+            .conversation_repo
+            .get_send_receipt(user_id, conversation_id, client_request_id)
+            .await?
+            .ok_or_else(|| ConversationError::not_found_reason("Send request not found"))?;
+        Ok(self
+            .send_message_response(
+                conversation_id,
+                receipt.msg_id,
+                receipt.turn_id,
+                Some(receipt.client_request_id),
+            )
+            .await)
+    }
+
     /// Send a user message to the conversation.
     ///
     /// 1. Validates the conversation belongs to the user
@@ -3830,7 +3884,7 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
-        if req.content.trim().is_empty() {
+        if req.client_request_id.is_none() && req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
             });
@@ -3860,6 +3914,56 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+
+        // An accepted retry is answered before runtime admission or mutable
+        // attachment/session resolution. The stored receipt never schedules work,
+        // including after cancellation, reset, or a process restart.
+        let admission = if req.client_request_id.is_some() {
+            Some(self.send_admission.lock().await)
+        } else {
+            None
+        };
+        let request_digest = if let Some(request_id) = req.client_request_id.as_deref() {
+            validate_send_request_id(&row, request_id)?;
+            // Versioned, typed tuple: defaults and JSON property order do not
+            // change identity. Array order, whitespace and all semantic fields do.
+            let payload = serde_json::to_vec(&(
+                1u8,
+                &req.content,
+                &req.files,
+                &req.sessions,
+                &req.inject_skills,
+                req.hidden,
+            ))
+            .map_err(|_| ConversationError::internal("Could not hash send request"))?;
+            let digest = format!("{:x}", Sha256::digest(payload));
+            if let Some(receipt) = self
+                .conversation_repo
+                .get_send_receipt(user_id, conversation_id, request_id)
+                .await?
+            {
+                if receipt.payload_sha256 != digest {
+                    return Err(ConversationError::Busy {
+                        reason: "client_request_id already accepted with another payload".into(),
+                    });
+                }
+                debug!(msg_id = %receipt.msg_id, turn_id = %receipt.turn_id, "Returning accepted send receipt without dispatch");
+                return Ok(self
+                    .send_message_response(
+                        conversation_id,
+                        receipt.msg_id,
+                        receipt.turn_id,
+                        Some(receipt.client_request_id),
+                    )
+                    .await);
+            }
+            Some(digest)
+        } else {
+            None
+        };
+        if req.content.trim().is_empty() {
+            return Err(ConversationError::bad_request("Message content must not be empty"));
+        }
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
@@ -3900,7 +4004,8 @@ impl ConversationService {
         // with the active turn's id. Every other case (including the 409 for
         // non-supporting backends) is unchanged and handled by the claim below.
         let mut fallback_user_msg: Option<String> = None;
-        if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
+        if req.client_request_id.is_none()
+            && let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
             && agent.supports_midturn_delivery()
         {
@@ -3986,15 +4091,57 @@ impl ConversationService {
             let was_deleting = turn_claim.release();
             self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
                 .await;
-            return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+            if req.client_request_id.is_some() {
+                return Err(ConversationError::Busy {
+                    reason: "Conversation cannot accept a durable send".into(),
+                });
+            }
+            return Ok(self
+                .send_message_response(conversation_id, user_msg_id, turn_id, req.client_request_id)
+                .await);
         }
         // The TurnEnded fallback already persisted + broadcast this message
         // (with the statusChanged flip) — doing it again would duplicate the
         // row and the live-view bubble.
         if !was_fallback {
-            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
-                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
-                return Err(e.into());
+            let outcome = if let (Some(request_id), Some(digest)) = (&req.client_request_id, request_digest) {
+                self.conversation_repo
+                    .insert_message_with_receipt(
+                        user_id,
+                        &user_msg,
+                        &SendRequestReceipt {
+                            client_request_id: request_id.clone(),
+                            payload_sha256: digest,
+                            msg_id: user_msg_id.clone(),
+                            turn_id: turn_id.clone(),
+                        },
+                    )
+                    .await
+            } else {
+                self.conversation_repo
+                    .insert_message(user_id, &user_msg)
+                    .await
+                    .map(|()| SendRequestInsert::Inserted)
+            };
+            let outcome = outcome.map_err(|error| {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&error), "Failed to insert user message");
+                ConversationError::from(error)
+            })?;
+            if let SendRequestInsert::Existing(receipt) = outcome {
+                // A second service instance can race outside our admission lock.
+                // Only the transaction winner broadcasts or spawns a turn.
+                let mut turn_claim = turn_claim;
+                let was_deleting = turn_claim.release();
+                self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                    .await;
+                return Ok(self
+                    .send_message_response(
+                        conversation_id,
+                        receipt.msg_id,
+                        receipt.turn_id,
+                        Some(receipt.client_request_id),
+                    )
+                    .await);
             }
 
             info!(msg_id = %user_msg_id, "User message persisted");
@@ -4013,6 +4160,8 @@ impl ConversationService {
                 }),
             ));
         }
+
+        drop(admission);
 
         // Build task options from conversation row
         let mut build_opts = match self.build_task_options(&row).await {
@@ -4037,7 +4186,9 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
                     .await;
-                return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
+                return Ok(self
+                    .send_message_response(conversation_id, user_msg_id, turn_id, req.client_request_id)
+                    .await);
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
@@ -4066,7 +4217,7 @@ impl ConversationService {
             "Message accepted, agent work scheduled"
         );
         Ok(self
-            .send_message_response(conversation_id, user_msg_id_ret, turn_id)
+            .send_message_response(conversation_id, user_msg_id_ret, turn_id, req.client_request_id)
             .await)
     }
 

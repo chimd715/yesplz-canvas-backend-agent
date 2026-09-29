@@ -36,7 +36,8 @@ pub use models::{
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, SendRequestInsert, SendRequestReceipt,
+    StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
@@ -49,20 +50,19 @@ pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     ActivityCursor, ArchiveScope, ConversationOutboxError, CreateAcpSessionParams, FeedbackDiagnosticsDbContext,
-    FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult,
-    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
-    IClientPreferenceRepository, IConversationOutboxRepository, IConversationRepository, ICronRepository,
-    IFeedbackDiagnosticsRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository,
-    IRemoteAgentRepository,
-    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository,
-    MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams,
-    SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationOutboxRepository,
-    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository,
-    SqliteOAuthTokenRepository, SqliteProjectStore,
+    FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest,
+    FeedbackDiagnosticsResult, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IChannelRepository, IClientPreferenceRepository, IConversationOutboxRepository, IConversationRepository,
+    ICronRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
+    IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository,
+    IUserOrderStore, IUserRepository, MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome,
+    PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository,
+    SqliteConversationOutboxRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
