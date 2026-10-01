@@ -7,7 +7,7 @@ use aion_config::hooks::HooksConfig;
 use aion_protocol::events::ToolCategory;
 use aion_tools::registry::ToolRegistry;
 use aion_tools::{Tool, ToolExecutionOutput};
-use aion_types::message::{ContentBlock, Role};
+use aion_types::message::ContentBlock;
 use aion_types::skill_types::ContextModifier;
 use aion_types::tool::{JsonSchema, ToolResult};
 use aionui_api_types::AskQuestionAnswer;
@@ -37,14 +37,8 @@ pub(super) struct NativeQuestions {
     events: broadcast::Sender<AgentStreamEvent>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     pending: Mutex<Option<PendingQuestion>>,
-    widget: AtomicBool,
-    confirmed: AtomicBool,
+    unanswered: AtomicBool,
     source: Mutex<Option<Value>>,
-}
-
-fn widget_instructions(text: &str) -> bool {
-    // ponytail: bundled header identifies widget intent; use resolved metadata if skill transport changes.
-    text.starts_with("---\nname: shop-widget\n")
 }
 
 fn result(content: impl Into<String>, is_error: bool) -> ToolResult {
@@ -61,16 +55,12 @@ impl NativeQuestions {
         confirmations: Arc<RwLock<Vec<Confirmation>>>,
         session: Option<&Session>,
     ) -> Arc<Self> {
-        let mut widget = false;
         let mut source = None;
         let mut calls = HashSet::new();
         if let Some(session) = session {
             for message in &session.messages {
                 for block in &message.content {
                     match block {
-                        ContentBlock::Text { text } if message.role == Role::User => {
-                            widget |= widget_instructions(text)
-                        }
                         ContentBlock::ToolUse { id, name, .. } if name == CONFIRM => {
                             calls.insert(id.clone());
                         }
@@ -97,27 +87,21 @@ impl NativeQuestions {
             events,
             confirmations,
             pending: Mutex::new(None),
-            widget: AtomicBool::new(widget),
-            confirmed: AtomicBool::new(false),
+            unanswered: AtomicBool::new(false),
             source: Mutex::new(source),
         })
     }
 
-    pub fn observe_input(&self, text: &str) {
-        if widget_instructions(text) {
-            self.widget.store(true, Ordering::Release);
-        }
-        if self.widget.load(Ordering::Acquire) {
-            self.confirmed.store(false, Ordering::Release);
+    pub fn begin_turn(&self) {
+        let pending = self.pending.lock().unwrap();
+        if pending.is_none() {
+            self.unanswered.store(false, Ordering::Release);
         }
     }
 
     fn blocked(&self, name: &str) -> bool {
-        if !self.widget.load(Ordering::Acquire) {
-            return false;
-        }
         let waiting = self.pending.lock().unwrap().is_some();
-        (waiting || !self.confirmed.load(Ordering::Acquire)) && !matches!(name, "Read" | "Glob" | "Grep" | "ViewImage")
+        (waiting || self.unanswered.load(Ordering::Acquire)) && !matches!(name, "Read" | "Glob" | "Grep" | "ViewImage")
     }
 
     pub fn cancel(&self) {
@@ -154,15 +138,27 @@ impl NativeQuestions {
                             .labels
                             .iter()
                             .all(|s| !s.trim().is_empty() && s.len() <= 4000)
-                        && (q["question"] != PLATFORM
-                            || matches[0].labels.iter().all(|s| {
-                                s == "Other"
-                                    || s.strip_prefix("Shopify (selected store: ")
-                                        .and_then(|s| s.strip_suffix(')'))
-                                        .is_some_and(|shop| {
-                                            shop.ends_with(".myshopify.com") && !shop.contains([' ', '/', '\n'])
+                        && q["options"].as_array().unwrap().iter().all(|option| {
+                            if option.get("action").is_none() {
+                                return true;
+                            }
+                            let label = option["label"].as_str().unwrap();
+                            let prefix = format!("{label} (selected store: ");
+                            matches[0].labels.iter().all(|answer| {
+                                answer != label
+                                    && answer.strip_prefix(prefix.as_str()).is_none_or(|store| {
+                                        store.strip_suffix(')').is_some_and(|shop| {
+                                            shop.strip_suffix(".myshopify.com").is_some_and(|name| {
+                                                !name.is_empty()
+                                                    && name.len() <= 63
+                                                    && !name.starts_with('-')
+                                                    && !name.ends_with('-')
+                                                    && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                                            })
                                         })
-                            }))
+                                    })
+                            })
+                        })
                 })
             {
                 return Err(AgentError::bad_request("Answer every question with a valid selection"));
@@ -190,12 +186,14 @@ impl NativeQuestions {
         } else {
             None
         };
+        let answered = value.is_some();
         let pending = slot.take().unwrap();
         self.remove_confirmation(id);
         pending
             .answer
             .send(value)
             .map_err(|_| AgentError::bad_request("Question is no longer pending"))?;
+        self.unanswered.store(!answered, Ordering::Release);
         info!(conversation_id = %self.conversation_id, request_id = id, "Native question resolved");
         Ok(())
     }
@@ -208,6 +206,7 @@ impl NativeQuestions {
             if slot.is_some() {
                 return None;
             }
+            self.unanswered.store(true, Ordering::Release);
             *slot = Some(PendingQuestion {
                 id: id.clone(),
                 questions: questions.clone(),
@@ -230,11 +229,7 @@ impl NativeQuestions {
             "session_id": self.conversation_id, "request_id": id, "questions": questions,
         })));
         info!(conversation_id = %self.conversation_id, request_id = %id, "Native question waiting");
-        let answer = receiver.await.ok().flatten();
-        if answer.is_none() && self.widget.load(Ordering::Acquire) {
-            self.confirmed.store(false, Ordering::Release);
-        }
-        answer
+        receiver.await.ok().flatten()
     }
 
     pub fn register(self: &Arc<Self>, registry: &mut ToolRegistry) {
@@ -283,7 +278,7 @@ impl Tool for GatedTool {
         self.inner().category()
     }
     fn is_concurrency_safe(&self, input: &Value) -> bool {
-        !self.questions.widget.load(Ordering::Acquire) && self.inner().is_concurrency_safe(input)
+        !self.questions.unanswered.load(Ordering::Acquire) && self.inner().is_concurrency_safe(input)
     }
     fn requires_image_input(&self) -> bool {
         self.inner().requires_image_input()
@@ -308,8 +303,8 @@ impl Tool for GatedTool {
     }
     async fn execute_with_follow_up(&self, input: Value) -> ToolExecutionOutput {
         if self.questions.blocked(&self.name) {
-            info!(conversation_id = %self.questions.conversation_id, tool = %self.name, "Widget tool blocked pending data decision");
-            return result("Blocked: call ConfirmWidgetData before implementation. Product questions require an answer even in YOLO.", true).into();
+            info!(conversation_id = %self.questions.conversation_id, tool = %self.name, "Native tool blocked pending question answer");
+            return result("Blocked: resolve the unanswered question before continuing implementation. Automatic tool approval does not answer user questions.", true).into();
         }
         self.inner().execute_with_follow_up(input).await
     }
@@ -335,9 +330,9 @@ impl Tool for QuestionTool {
     }
     fn description(&self) -> &str {
         if self.confirm {
-            "Required before implementation on every Shop Widget turn. Decide whether real store/product data is needed. Static FAQ/size guides: false. Product/recommendation widgets: true. Waits for Shopify/Other and source confirmation, or reuses an already confirmed source. Set reselect_source true when the user requests a different source. No connection means no claimed product or recommendation access."
+            "Optional legacy store-data question helper. Waits for Shopify/Other and source confirmation when real store data is needed, or reuses an already confirmed source. Set reselect_source true when the user requests a different source. No connection means no claimed product or recommendation access. New skills can ask required parameters with AskUserQuestion."
         } else {
-            "Ask missing parameters for any skill or extension through the existing question UI. Supply a stable key per parameter, question text and optional choices. Empty options means free text. Returns answers and parameters keyed by key; multiSelect returns an array, otherwise a string. The current turn waits even in YOLO."
+            "Ask missing parameters for any skill or extension through the existing question UI. Supply a stable key per parameter, question text and optional choices. A choice may request the supported Shopify connection with action {type: connect, connector: shopify}; never supply a URL. Empty options means free text. Returns answers and parameters keyed by key; multiSelect returns an array, otherwise a string. The current turn waits even in YOLO."
         }
     }
     fn input_schema(&self) -> JsonSchema {
@@ -349,7 +344,10 @@ impl Tool for QuestionTool {
                 "key":{"type":"string","description":"Stable parameter name, such as store or api_url; letters, numbers and underscores"},
                 "question":{"type":"string"}, "header":{"type":"string"},
                 "multiSelect":{"type":"boolean"}, "options":{"type":"array", "items":{"type":"object", "properties":{
-                    "label":{"type":"string"}, "description":{"type":"string"}}, "required":["label"]}}},
+                    "label":{"type":"string"}, "description":{"type":"string"},
+                    "action":{"type":"object","properties":{"type":{"type":"string","enum":["connect"]},
+                        "connector":{"type":"string","enum":["shopify"]}},"required":["type","connector"],"additionalProperties":false}},
+                    "required":["label"],"additionalProperties":false}}},
                 "required":["question"]}}}, "required":["questions"]})
     }
     fn category(&self) -> ToolCategory {
@@ -392,11 +390,13 @@ impl Tool for QuestionTool {
                     && q["options"].as_array().is_some_and(|opts| {
                         opts.len() <= 8
                             && opts.iter().all(|o| {
-                                o["label"]
+                                o.as_object().is_some_and(|o| o.keys().all(|key| matches!(key.as_str(), "label" | "description" | "action")))
+                                    && o["label"]
                                     .as_str()
                                     .is_some_and(|s| !s.trim().is_empty() && s.len() <= 400)
                                     && o.get("description")
                                         .is_none_or(|d| d.as_str().is_some_and(|s| s.len() <= 2000))
+                                    && o.get("action").is_none_or(|action| *action == json!({"type":"connect","connector":"shopify"}))
                             })
                     })
                     && q.get("multiSelect").is_none_or(Value::is_boolean)
@@ -419,7 +419,6 @@ impl Tool for QuestionTool {
             && !decision.reselect_source
             && let Some(source) = cached
         {
-            self.questions.confirmed.store(true, Ordering::Release);
             return result(
                 json!({"widget_data_confirmed":true,"needs_store_data":true,"source":source,"reused":true}).to_string(),
                 false,
@@ -429,7 +428,7 @@ impl Tool for QuestionTool {
         if decision.needs_store_data {
             let Some(answer) = self
                 .questions
-                .ask(json!([{"question":PLATFORM,"options":[{"label":"Shopify"},{"label":"Other"}]}]))
+                .ask(json!([{"question":PLATFORM,"options":[{"label":"Shopify","action":{"type":"connect","connector":"shopify"}},{"label":"Other"}]}]))
                 .await
             else {
                 return result("Data source not confirmed. Implementation remains blocked.", true);
@@ -445,7 +444,6 @@ impl Tool for QuestionTool {
         if decision.needs_store_data {
             *self.questions.source.lock().unwrap() = Some(source.clone());
         }
-        self.questions.confirmed.store(true, Ordering::Release);
         result(json!({"widget_data_confirmed":true,"needs_store_data":decision.needs_store_data,"source":source,
             "note":"A store choice is not evidence of available product/recommendation tools. Ask further missing data questions; never invent live data."}).to_string(), false)
     }
@@ -455,31 +453,20 @@ impl Tool for QuestionTool {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn widget_writes_wait_for_decisions_and_user_answers() {
+    async fn generic_questions_block_writes_until_answered() {
         let (events, mut receiver) = broadcast::channel(8);
         let state = NativeQuestions::new("test".into(), events, Arc::new(RwLock::new(vec![])), None);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("widget.js");
+        let path = dir.path().join("app.js");
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(aion_tools::write::WriteTool::new(None)));
         state.register(&mut registry);
-        let write = json!({"file_path":path,"content":"widget"});
-        state.observe_input("---\nname: shop-widget\n");
-        assert!(registry.get("Write").unwrap().execute(write.clone()).await.is_error);
-        assert!(!path.exists());
-        assert!(state.blocked("ExecCommand") && state.blocked("Spawn") && !state.blocked("Read"));
-        assert!(
-            !registry
-                .get(CONFIRM)
-                .unwrap()
-                .execute(json!({"needs_store_data":false}))
-                .await
-                .is_error
-        );
+        let write = json!({"file_path":path,"content":"app"});
+        state.begin_turn();
+        // No mode name or source-decision tool is required before ordinary work.
         assert!(!registry.get("Write").unwrap().execute(write.clone()).await.is_error);
         assert!(path.exists());
-        state.observe_input("Use real products now");
-        assert!(state.blocked("Write"));
+        assert!(!state.blocked("ExecCommand") && !state.blocked("Spawn"));
         let tool = QuestionTool {
             questions: state.clone(),
             confirm: true,
@@ -489,6 +476,10 @@ mod tests {
             panic!("Missing question");
         };
         assert!(!task.is_finished());
+        assert_eq!(q["questions"][0]["options"][0]["action"], json!({"type":"connect","connector":"shopify"}));
+        assert!(state.blocked("ExecCommand") && state.blocked("Spawn") && !state.blocked("Read"));
+        state.begin_turn();
+        assert!(state.blocked("Write"), "A new input cannot clear a still-pending question");
         assert!(state.answer("wrong", None).is_err());
         assert!(
             state
@@ -524,6 +515,11 @@ mod tests {
             )
             .unwrap();
         assert!(!task.await.unwrap().is_error && !state.blocked("Write"));
+        let cached = registry.get(CONFIRM).unwrap().execute(json!({"needs_store_data":true})).await;
+        assert!(!cached.is_error);
+        let cached: Value = serde_json::from_str(&cached.content).unwrap();
+        assert_eq!(cached["reused"], true);
+        assert_eq!(cached["source"]["platform"], "Other");
         let tool = QuestionTool {
             questions: state.clone(),
             confirm: false,
@@ -535,7 +531,9 @@ mod tests {
         let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else {
             panic!("Missing parameter question");
         };
-        assert!(registry.get("Write").unwrap().execute(write).await.is_error);
+        let blocked = registry.get("Write").unwrap().execute(write).await;
+        assert!(blocked.is_error);
+        assert_eq!(blocked.content, "Blocked: resolve the unanswered question before continuing implementation. Automatic tool approval does not answer user questions.");
         state
             .answer(
                 q["request_id"].as_str().unwrap(),
@@ -554,7 +552,97 @@ mod tests {
         let task = tokio::spawn(async move { tool.execute(json!({"questions":[{"question":"Continue?"}]})).await });
         receiver.recv().await.unwrap();
         state.cancel();
-        assert!(task.await.unwrap().is_error && state.blocked("Write"));
+        let cancelled = task.await.unwrap();
+        assert!(cancelled.is_error && state.blocked("Write"));
+        assert_eq!(cancelled.content, "User declined the question. Do not assume an answer or continue implementation.");
         assert!(state.confirmations.read().unwrap().is_empty());
+        registry.get(CONFIRM).unwrap().execute(json!({"needs_store_data":false})).await;
+        assert!(state.blocked("Write"), "The legacy decision tool cannot bypass an unanswered question");
+        state.begin_turn();
+        assert!(!state.blocked("Write"), "A later user turn can give new instructions");
+    }
+
+    #[tokio::test]
+    async fn connector_action_preserves_custom_labels_and_parameter_answers() {
+        let (events, mut receiver) = broadcast::channel(8);
+        let state = NativeQuestions::new("custom-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
+        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"questions":[{"key":"store","question":"Choose a catalog source", "options":[
+                {"label":"Connect the catalog","action":{"type":"connect","connector":"shopify"}},
+                {"label":"Use sample data"}]}]})).await
+        });
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing connector question"); };
+        assert_eq!(q["questions"][0]["options"][0]["action"], json!({"type":"connect","connector":"shopify"}));
+        assert_eq!(state.confirmations.read().unwrap()[0].questions.as_ref().unwrap(), &q["questions"]);
+        assert!(state.blocked("Write"));
+        for label in ["Connect the catalog", "Connect the catalog (selected store: https://fixture.myshopify.com)",
+            "Connect the catalog (selected store: fixture.myshopify.com/other)", "Connect the catalog (selected store: -bad.myshopify.com)"] {
+            let error = state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
+                question: "Choose a catalog source".into(), labels: vec![label.into()],
+            }])).unwrap_err();
+            assert_eq!(error.to_string(), "Bad request: Answer every question with a valid selection");
+            assert!(!task.is_finished() && state.blocked("Write"));
+        }
+        let selected = "Connect the catalog (selected store: fixture.myshopify.com)";
+        state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
+            question: "Choose a catalog source".into(), labels: vec![selected.into()],
+        }])).unwrap();
+        let output = task.await.unwrap();
+        assert!(!output.is_error && !state.blocked("Write"));
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(value["parameters"]["store"], selected);
+        assert_eq!(value["answers"][0]["labels"], json!([selected]));
+        assert!(state.confirmations.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn question_text_never_selects_a_business_workflow() {
+        let (events, mut receiver) = broadcast::channel(8);
+        let state = NativeQuestions::new("another-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
+        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"questions":[{"key":"platform","question":PLATFORM}]})).await
+        });
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing free-text question"); };
+        state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
+            question: PLATFORM.into(), labels: vec!["A custom catalog API".into()],
+        }])).unwrap();
+        let output = task.await.unwrap();
+        assert!(!output.is_error);
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(value["parameters"]["platform"], "A custom catalog API");
+        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"questions":[{"question":"Which required value?"}]})).await
+        });
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing question to decline"); };
+        state.answer(q["request_id"].as_str().unwrap(), None).unwrap();
+        let output = task.await.unwrap();
+        assert!(output.is_error && state.blocked("Write"));
+        assert_eq!(output.content, "User declined the question. Do not assume an answer or continue implementation.");
+        assert!(state.confirmations.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsupported_connector_actions_are_rejected_before_asking() {
+        let (events, mut receiver) = broadcast::channel(8);
+        let state = NativeQuestions::new("custom-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
+        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let schema = tool.input_schema();
+        assert_eq!(schema["properties"]["questions"]["items"]["properties"]["options"]["items"]["properties"]["action"]["additionalProperties"], false);
+        for action in [Value::Null, json!("shopify"), json!({}), json!({"type":"connect"}),
+            json!({"type":"open","connector":"shopify"}), json!({"type":"connect","connector":"other"}),
+            json!({"type":"connect","connector":"shopify","url":"https://example.com"})] {
+            let rejected = tool.execute(json!({"questions":[{"question":"Which source?","options":[{"label":"Connect","action":action}]}]})).await;
+            assert!(rejected.is_error);
+            assert_eq!(rejected.content, "Invalid questions");
+        }
+        let rejected = tool.execute(json!({"questions":[{"question":"Which source?","options":[{
+            "label":"Connect","action":{"type":"connect","connector":"shopify"},"url":"https://example.com"}]}]})).await;
+        assert!(rejected.is_error);
+        assert_eq!(rejected.content, "Invalid questions");
+        assert!(receiver.try_recv().is_err() && state.confirmations.read().unwrap().is_empty());
+        assert!(!state.blocked("Write"));
     }
 }

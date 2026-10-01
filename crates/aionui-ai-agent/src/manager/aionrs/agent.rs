@@ -210,7 +210,7 @@ impl AionrsAgentManager {
         config.session.enabled = true;
         config.session.directory = config_extra.session_directory.to_string_lossy().into_owned();
         config.compat.image_input = Some(image_input_capability);
-        // Product questions require an answer, not a separate permission to ask.
+        // User questions require an answer, not a separate permission to ask.
         config
             .tools
             .allow_list
@@ -425,7 +425,7 @@ impl IAgentTask for AionrsAgentManager {
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
-        self.questions.observe_input(&data.content);
+        self.questions.begin_turn();
         self.dump_aionrs_final_input(&data);
 
         // Keep attachment paths in the provider-independent history. Images
