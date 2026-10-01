@@ -31,6 +31,7 @@ use tower::ServiceExt;
 
 const PREPARE: &str = "/api/conversations/internal/frozen-continuations/prepare";
 const RECOVER: &str = "/api/conversations/internal/frozen-continuations/recover";
+const TURN_FREEZE: &str = "/api/conversations/internal/backup/turn-freeze";
 const BOOTSTRAP: &str = "fixture-bootstrap-credential";
 
 async fn fixture() -> (Router, AppServices, tempfile::TempDir, String, String) {
@@ -429,4 +430,23 @@ async fn frozen_continuation_control_is_disabled_without_build_identity_and_in_l
     let mut local = request(PREPARE, json!({}), &token, &csrf);
     local.headers_mut().remove("authorization");
     assert_status(&app, local, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn backup_turn_freeze_requires_private_authority_and_reports_released_claims() {
+    let (app, services, _directory, token, csrf) = fixture().await;
+    let runtime = services.conversation_runtime_state.clone();
+    let claim = runtime.try_claim_turn("conversation-a", "turn-a").unwrap();
+    let mut unauthorized = request(TURN_FREEZE, json!({}), &token, &csrf);
+    unauthorized.headers_mut().remove("x-aioncore-bootstrap-secret");
+    assert_status(&app, unauthorized, StatusCode::UNAUTHORIZED).await;
+    assert_eq!(runtime.backup_turn_status().unwrap(), (false, 1));
+
+    let frozen = assert_status(&app, request(TURN_FREEZE, json!({}), &token, &csrf), StatusCode::OK).await;
+    assert_eq!(frozen["data"]["frozen"], true);
+    assert_eq!(frozen["data"]["activeTurnCount"], 1);
+    assert!(runtime.try_claim_turn("conversation-b", "turn-b").is_err());
+    drop(claim);
+    let drained = assert_status(&app, request(TURN_FREEZE, json!({}), &token, &csrf), StatusCode::OK).await;
+    assert_eq!(drained["data"]["activeTurnCount"], 0);
 }

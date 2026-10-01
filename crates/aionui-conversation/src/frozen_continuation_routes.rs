@@ -9,6 +9,7 @@ use axum::middleware::{Next, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
+use serde::Serialize;
 
 use aionui_ai_agent::manager::aionrs::FrozenNativeSession;
 use aionui_api_types::{
@@ -39,6 +40,10 @@ pub fn frozen_continuation_routes(state: FrozenContinuationRouterState) -> Route
             "/api/conversations/internal/frozen-continuations/recover",
             post(recover),
         )
+        .route(
+            "/api/conversations/internal/backup/turn-freeze",
+            post(freeze_turns).get(turn_freeze_status),
+        )
         .route_layer(from_fn_with_state(
             Arc::new(RateLimiter::authenticated_action()),
             authenticated_action_rate_limit_middleware,
@@ -46,6 +51,44 @@ pub fn frozen_continuation_routes(state: FrozenContinuationRouterState) -> Route
         .route_layer(from_fn_with_state(state.clone(), control_guard))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnFreezeStatus {
+    frozen: bool,
+    active_turn_count: usize,
+}
+
+fn turn_status(state: &FrozenContinuationRouterState) -> Result<Json<ApiResponse<TurnFreezeStatus>>, ApiError> {
+    let (frozen, active_turn_count) = state
+        .service
+        .runtime_state()
+        .backup_turn_status()
+        .map_err(|_| ApiError::Internal("Unable to read native turn state".into()))?;
+    Ok(Json(ApiResponse::ok(TurnFreezeStatus {
+        frozen,
+        active_turn_count,
+    })))
+}
+
+async fn freeze_turns(
+    State(state): State<FrozenContinuationRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<TurnFreezeStatus>>, ApiError> {
+    state
+        .service
+        .runtime_state()
+        .freeze_turns_for_backup()
+        .map_err(|_| ApiError::Internal("Unable to freeze native turns".into()))?;
+    turn_status(&state)
+}
+
+async fn turn_freeze_status(
+    State(state): State<FrozenContinuationRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<TurnFreezeStatus>>, ApiError> {
+    turn_status(&state)
 }
 
 async fn control_guard(

@@ -30,6 +30,7 @@ struct ConversationRuntimeState {
     /// time. See [`ConversationRuntimeStateService::should_log_once_for_turn`].
     logged_once_per_turn: HashMap<(OncePerTurn, String), String>,
     shutting_down: bool,
+    backup_frozen: bool,
 }
 
 /// Events that are worth one log line per turn rather than one per attempt.
@@ -74,6 +75,12 @@ impl ConversationRuntimeStateService {
             );
             ConversationError::internal("conversation runtime state lock poisoned")
         })?;
+
+        if state.backup_frozen {
+            return Err(ConversationError::Busy {
+                reason: "conversation runtime is frozen for backup".into(),
+            });
+        }
 
         if state.shutting_down {
             info!(
@@ -457,6 +464,27 @@ impl ConversationRuntimeStateService {
         }
     }
 
+    /// Reject new user, agent-driven and cron turns under the same lock used by
+    /// claims. Existing turns retain their normal completion and persistence path.
+    pub fn freeze_turns_for_backup(&self) -> Result<usize, ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        state.backup_frozen = true;
+        Ok(state.active_turns.len())
+    }
+
+    /// A zero count after a freeze acknowledges native turn-claim release only.
+    /// It says nothing about file endpoints or processes outside this runtime.
+    pub fn backup_turn_status(&self) -> Result<(bool, usize), ConversationError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        Ok((state.backup_frozen, state.active_turns.len()))
+    }
+
     pub fn is_shutting_down(&self) -> bool {
         self.state.lock().map(|state| state.shutting_down).unwrap_or(true)
     }
@@ -622,6 +650,18 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn backup_freeze_waits_for_existing_turn_claims_without_cancelling_them() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let claim = state.try_claim_turn("conv-1", "turn-a").unwrap();
+        assert_eq!(state.freeze_turns_for_backup().unwrap(), 1);
+        assert_eq!(state.backup_turn_status().unwrap(), (true, 1));
+        assert!(state.try_claim_turn("conv-2", "turn-b").is_err());
+        assert!(state.claim_for_agent_turn("conv-2", "cron-turn").is_none());
+        drop(claim);
+        assert_eq!(state.backup_turn_status().unwrap(), (true, 0));
+    }
 
     #[test]
     fn claim_records_active_turn_id_in_summary() {
