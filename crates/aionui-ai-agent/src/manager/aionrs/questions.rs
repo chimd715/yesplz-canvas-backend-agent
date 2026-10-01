@@ -153,7 +153,9 @@ impl NativeQuestions {
                                                     && name.len() <= 63
                                                     && !name.starts_with('-')
                                                     && !name.ends_with('-')
-                                                    && name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                                                    && name.bytes().all(|c| {
+                                                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'
+                                                    })
                                             })
                                         })
                                     })
@@ -390,13 +392,16 @@ impl Tool for QuestionTool {
                     && q["options"].as_array().is_some_and(|opts| {
                         opts.len() <= 8
                             && opts.iter().all(|o| {
-                                o.as_object().is_some_and(|o| o.keys().all(|key| matches!(key.as_str(), "label" | "description" | "action")))
-                                    && o["label"]
+                                o.as_object().is_some_and(|o| {
+                                    o.keys()
+                                        .all(|key| matches!(key.as_str(), "label" | "description" | "action"))
+                                }) && o["label"]
                                     .as_str()
                                     .is_some_and(|s| !s.trim().is_empty() && s.len() <= 400)
                                     && o.get("description")
                                         .is_none_or(|d| d.as_str().is_some_and(|s| s.len() <= 2000))
-                                    && o.get("action").is_none_or(|action| *action == json!({"type":"connect","connector":"shopify"}))
+                                    && o.get("action")
+                                        .is_none_or(|action| *action == json!({"type":"connect","connector":"shopify"}))
                             })
                     })
                     && q.get("multiSelect").is_none_or(Value::is_boolean)
@@ -476,10 +481,16 @@ mod tests {
             panic!("Missing question");
         };
         assert!(!task.is_finished());
-        assert_eq!(q["questions"][0]["options"][0]["action"], json!({"type":"connect","connector":"shopify"}));
+        assert_eq!(
+            q["questions"][0]["options"][0]["action"],
+            json!({"type":"connect","connector":"shopify"})
+        );
         assert!(state.blocked("ExecCommand") && state.blocked("Spawn") && !state.blocked("Read"));
         state.begin_turn();
-        assert!(state.blocked("Write"), "A new input cannot clear a still-pending question");
+        assert!(
+            state.blocked("Write"),
+            "A new input cannot clear a still-pending question"
+        );
         assert!(state.answer("wrong", None).is_err());
         assert!(
             state
@@ -515,7 +526,11 @@ mod tests {
             )
             .unwrap();
         assert!(!task.await.unwrap().is_error && !state.blocked("Write"));
-        let cached = registry.get(CONFIRM).unwrap().execute(json!({"needs_store_data":true})).await;
+        let cached = registry
+            .get(CONFIRM)
+            .unwrap()
+            .execute(json!({"needs_store_data":true}))
+            .await;
         assert!(!cached.is_error);
         let cached: Value = serde_json::from_str(&cached.content).unwrap();
         assert_eq!(cached["reused"], true);
@@ -533,7 +548,10 @@ mod tests {
         };
         let blocked = registry.get("Write").unwrap().execute(write).await;
         assert!(blocked.is_error);
-        assert_eq!(blocked.content, "Blocked: resolve the unanswered question before continuing implementation. Automatic tool approval does not answer user questions.");
+        assert_eq!(
+            blocked.content,
+            "Blocked: resolve the unanswered question before continuing implementation. Automatic tool approval does not answer user questions."
+        );
         state
             .answer(
                 q["request_id"].as_str().unwrap(),
@@ -554,10 +572,20 @@ mod tests {
         state.cancel();
         let cancelled = task.await.unwrap();
         assert!(cancelled.is_error && state.blocked("Write"));
-        assert_eq!(cancelled.content, "User declined the question. Do not assume an answer or continue implementation.");
+        assert_eq!(
+            cancelled.content,
+            "User declined the question. Do not assume an answer or continue implementation."
+        );
         assert!(state.confirmations.read().unwrap().is_empty());
-        registry.get(CONFIRM).unwrap().execute(json!({"needs_store_data":false})).await;
-        assert!(state.blocked("Write"), "The legacy decision tool cannot bypass an unanswered question");
+        registry
+            .get(CONFIRM)
+            .unwrap()
+            .execute(json!({"needs_store_data":false}))
+            .await;
+        assert!(
+            state.blocked("Write"),
+            "The legacy decision tool cannot bypass an unanswered question"
+        );
         state.begin_turn();
         assert!(!state.blocked("Write"), "A later user turn can give new instructions");
     }
@@ -566,28 +594,61 @@ mod tests {
     async fn connector_action_preserves_custom_labels_and_parameter_answers() {
         let (events, mut receiver) = broadcast::channel(8);
         let state = NativeQuestions::new("custom-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
-        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let tool = QuestionTool {
+            questions: state.clone(),
+            confirm: false,
+        };
         let task = tokio::spawn(async move {
-            tool.execute(json!({"questions":[{"key":"store","question":"Choose a catalog source", "options":[
+            tool.execute(
+                json!({"questions":[{"key":"store","question":"Choose a catalog source", "options":[
                 {"label":"Connect the catalog","action":{"type":"connect","connector":"shopify"}},
-                {"label":"Use sample data"}]}]})).await
+                {"label":"Use sample data"}]}]}),
+            )
+            .await
         });
-        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing connector question"); };
-        assert_eq!(q["questions"][0]["options"][0]["action"], json!({"type":"connect","connector":"shopify"}));
-        assert_eq!(state.confirmations.read().unwrap()[0].questions.as_ref().unwrap(), &q["questions"]);
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else {
+            panic!("Missing connector question");
+        };
+        assert_eq!(
+            q["questions"][0]["options"][0]["action"],
+            json!({"type":"connect","connector":"shopify"})
+        );
+        assert_eq!(
+            state.confirmations.read().unwrap()[0].questions.as_ref().unwrap(),
+            &q["questions"]
+        );
         assert!(state.blocked("Write"));
-        for label in ["Connect the catalog", "Connect the catalog (selected store: https://fixture.myshopify.com)",
-            "Connect the catalog (selected store: fixture.myshopify.com/other)", "Connect the catalog (selected store: -bad.myshopify.com)"] {
-            let error = state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
-                question: "Choose a catalog source".into(), labels: vec![label.into()],
-            }])).unwrap_err();
-            assert_eq!(error.to_string(), "Bad request: Answer every question with a valid selection");
+        for label in [
+            "Connect the catalog",
+            "Connect the catalog (selected store: https://fixture.myshopify.com)",
+            "Connect the catalog (selected store: fixture.myshopify.com/other)",
+            "Connect the catalog (selected store: -bad.myshopify.com)",
+        ] {
+            let error = state
+                .answer(
+                    q["request_id"].as_str().unwrap(),
+                    Some(vec![AskQuestionAnswer {
+                        question: "Choose a catalog source".into(),
+                        labels: vec![label.into()],
+                    }]),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Bad request: Answer every question with a valid selection"
+            );
             assert!(!task.is_finished() && state.blocked("Write"));
         }
         let selected = "Connect the catalog (selected store: fixture.myshopify.com)";
-        state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
-            question: "Choose a catalog source".into(), labels: vec![selected.into()],
-        }])).unwrap();
+        state
+            .answer(
+                q["request_id"].as_str().unwrap(),
+                Some(vec![AskQuestionAnswer {
+                    question: "Choose a catalog source".into(),
+                    labels: vec![selected.into()],
+                }]),
+            )
+            .unwrap();
         let output = task.await.unwrap();
         assert!(!output.is_error && !state.blocked("Write"));
         let value: Value = serde_json::from_str(&output.content).unwrap();
@@ -600,27 +661,48 @@ mod tests {
     async fn question_text_never_selects_a_business_workflow() {
         let (events, mut receiver) = broadcast::channel(8);
         let state = NativeQuestions::new("another-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
-        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let tool = QuestionTool {
+            questions: state.clone(),
+            confirm: false,
+        };
         let task = tokio::spawn(async move {
-            tool.execute(json!({"questions":[{"key":"platform","question":PLATFORM}]})).await
+            tool.execute(json!({"questions":[{"key":"platform","question":PLATFORM}]}))
+                .await
         });
-        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing free-text question"); };
-        state.answer(q["request_id"].as_str().unwrap(), Some(vec![AskQuestionAnswer {
-            question: PLATFORM.into(), labels: vec!["A custom catalog API".into()],
-        }])).unwrap();
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else {
+            panic!("Missing free-text question");
+        };
+        state
+            .answer(
+                q["request_id"].as_str().unwrap(),
+                Some(vec![AskQuestionAnswer {
+                    question: PLATFORM.into(),
+                    labels: vec!["A custom catalog API".into()],
+                }]),
+            )
+            .unwrap();
         let output = task.await.unwrap();
         assert!(!output.is_error);
         let value: Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(value["parameters"]["platform"], "A custom catalog API");
-        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let tool = QuestionTool {
+            questions: state.clone(),
+            confirm: false,
+        };
         let task = tokio::spawn(async move {
-            tool.execute(json!({"questions":[{"question":"Which required value?"}]})).await
+            tool.execute(json!({"questions":[{"question":"Which required value?"}]}))
+                .await
         });
-        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else { panic!("Missing question to decline"); };
+        let AgentStreamEvent::Ask(q) = receiver.recv().await.unwrap() else {
+            panic!("Missing question to decline");
+        };
         state.answer(q["request_id"].as_str().unwrap(), None).unwrap();
         let output = task.await.unwrap();
         assert!(output.is_error && state.blocked("Write"));
-        assert_eq!(output.content, "User declined the question. Do not assume an answer or continue implementation.");
+        assert_eq!(
+            output.content,
+            "User declined the question. Do not assume an answer or continue implementation."
+        );
         assert!(state.confirmations.read().unwrap().is_empty());
     }
 
@@ -628,18 +710,36 @@ mod tests {
     async fn unsupported_connector_actions_are_rejected_before_asking() {
         let (events, mut receiver) = broadcast::channel(8);
         let state = NativeQuestions::new("custom-mode".into(), events, Arc::new(RwLock::new(vec![])), None);
-        let tool = QuestionTool { questions: state.clone(), confirm: false };
+        let tool = QuestionTool {
+            questions: state.clone(),
+            confirm: false,
+        };
         let schema = tool.input_schema();
-        assert_eq!(schema["properties"]["questions"]["items"]["properties"]["options"]["items"]["properties"]["action"]["additionalProperties"], false);
-        for action in [Value::Null, json!("shopify"), json!({}), json!({"type":"connect"}),
-            json!({"type":"open","connector":"shopify"}), json!({"type":"connect","connector":"other"}),
-            json!({"type":"connect","connector":"shopify","url":"https://example.com"})] {
-            let rejected = tool.execute(json!({"questions":[{"question":"Which source?","options":[{"label":"Connect","action":action}]}]})).await;
+        assert_eq!(
+            schema["properties"]["questions"]["items"]["properties"]["options"]["items"]["properties"]["action"]["additionalProperties"],
+            false
+        );
+        for action in [
+            Value::Null,
+            json!("shopify"),
+            json!({}),
+            json!({"type":"connect"}),
+            json!({"type":"open","connector":"shopify"}),
+            json!({"type":"connect","connector":"other"}),
+            json!({"type":"connect","connector":"shopify","url":"https://example.com"}),
+        ] {
+            let rejected = tool
+                .execute(
+                    json!({"questions":[{"question":"Which source?","options":[{"label":"Connect","action":action}]}]}),
+                )
+                .await;
             assert!(rejected.is_error);
             assert_eq!(rejected.content, "Invalid questions");
         }
-        let rejected = tool.execute(json!({"questions":[{"question":"Which source?","options":[{
-            "label":"Connect","action":{"type":"connect","connector":"shopify"},"url":"https://example.com"}]}]})).await;
+        let rejected = tool
+            .execute(json!({"questions":[{"question":"Which source?","options":[{
+            "label":"Connect","action":{"type":"connect","connector":"shopify"},"url":"https://example.com"}]}]}))
+            .await;
         assert!(rejected.is_error);
         assert_eq!(rejected.content, "Invalid questions");
         assert!(receiver.try_recv().is_err() && state.confirmations.read().unwrap().is_empty());
