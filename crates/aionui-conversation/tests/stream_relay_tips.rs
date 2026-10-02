@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use aion_agent::output::OutputSink;
 use aionui_ai_agent::{
-    AgentStreamEvent,
+    AgentStreamEvent, BackendOutputSink,
     protocol::events::{FinishEventData, TipType, TipsEventData},
 };
 use aionui_common::now_ms;
-use aionui_conversation::stream_relay::{StreamRelay, SupersedingTipTotals};
+use aionui_conversation::stream_relay::{RelayTerminal, StreamRelay, SupersedingTipTotals};
 use aionui_db::{
     IConversationRepository, MessagePageDirection, MessagePageParams, SqliteConversationRepository,
     init_database_memory, models::ConversationRow,
@@ -40,6 +41,65 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
     .unwrap();
 
     (repo, db)
+}
+
+#[tokio::test]
+async fn autocompact_warning_keeps_relay_open_for_native_output() {
+    let (repo, _db) = setup_repo().await;
+    let bus = Arc::new(BroadcastEventBus::new(64));
+    let (tx, rx) = broadcast::channel(64);
+    let sink = BackendOutputSink::new(tx);
+    let relay = StreamRelay::new(
+        "conv-1".into(),
+        "asst-1".into(),
+        "turn-1".into(),
+        "system_default_user".into(),
+        repo.clone(),
+        bus,
+    );
+
+    // Verified: pinned aionrs v0.2.11 engine.rs continues after this diagnostic.
+    let warning = "Autocompact failed: Stream error: connection interrupted";
+    sink.emit_error(warning);
+    sink.emit_text_delta("Continuing the requested work.", "native-msg");
+    sink.emit_tool_call("read-1", "Read", r#"{"path":"index.html"}"#);
+    sink.emit_tool_result("read-1", "Read", false, "file contents");
+    sink.emit_stream_end("native-msg", 1, 100, 20, 0, 0);
+
+    let outcome = relay.consume(rx).await;
+    assert_eq!(outcome.terminal, RelayTerminal::Finish);
+    assert!(outcome.attempt.saw_visible_output);
+    assert!(outcome.attempt.saw_tool_or_side_effect);
+    assert!(outcome.attempt.persisted_assistant_output);
+    assert!(outcome.attempt.terminal_error.is_none());
+
+    let messages = repo
+        .list_messages_page(
+            "system_default_user",
+            "conv-1",
+            &MessagePageParams {
+                limit: 100,
+                direction: MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    let tip = messages.items.iter().find(|row| row.r#type == "tips").unwrap();
+    let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+    assert_eq!(content["content"], warning);
+    assert_eq!(content["type"], "warning");
+    assert!(messages.items.iter().any(|row| {
+        row.r#type == "text"
+            && row.status.as_deref() == Some("finish")
+            && row.content.contains("Continuing the requested work.")
+    }));
+    assert!(
+        messages
+            .items
+            .iter()
+            .any(|row| { row.status.as_deref() == Some("finish") && row.content.contains("aionrs-read-1") })
+    );
+    assert!(!messages.items.iter().any(|row| row.status.as_deref() == Some("error")));
 }
 
 #[tokio::test]

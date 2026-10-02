@@ -20,6 +20,23 @@ ordinary tool-result errors and recoverable compaction errors do not set it.
 Review this contract and run the real-engine failure-injection fixtures whenever
 the native dependency changes. Public live history/export APIs are unavailable.
 
+## Recoverable compaction diagnostics
+
+In pinned aionrs v0.2.11 (`crates/aion-agent/src/engine.rs`, commit
+`8e61a90329fa9f67c4fdf7e97fe02c24dba33f75`), an automatic compaction failure
+emits `Autocompact failed: ` through `OutputSink::emit_error` and continues the
+native turn. Core maps only that diagnostic to a nonterminal Warning tip so
+the relay keeps receiving subsequent text, tools and the actual Finish/Error.
+The warning is retained in conversation history; a payload-free warning log
+records the classification. Other errors, including native session-save
+failures, retain their existing terminal behavior.
+
+This fixes premature relay termination, not compaction latency or provider
+timeouts. It does not alter context thresholds, retries, models, persisted
+sessions or checkpoint eligibility. Existing workspaces require a rebuilt Core
+binary and a controlled idle-runtime upgrade; a management-server deployment
+alone does not install this change.
+
 ## Private coordinator contract
 
 Relative to Core's configured native session directory (normally

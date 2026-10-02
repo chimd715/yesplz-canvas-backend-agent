@@ -152,6 +152,22 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_error(&self, msg: &str) {
+        // Verified: pinned aionrs v0.2.11 engine.rs continues after this error.
+        // A terminal Error would close the relay while the engine keeps running.
+        if msg.starts_with("Autocompact failed: ") {
+            tracing::warn!(
+                diagnostic_event = "aionrs.autocompact_failed",
+                "Automatic context compaction failed; native turn continues"
+            );
+            let _ = self.event_tx.send(AgentStreamEvent::Tips(TipsEventData {
+                content: msg.to_owned(),
+                tip_type: TipType::Warning,
+                code: None,
+                params: None,
+                supersedes_key: None,
+            }));
+            return;
+        }
         // Verified against pinned aionrs v0.2.11 engine.rs::save_session.
         // Observe the synchronous callback, even when there is no receiver or
         // the broadcast buffer overflows. Tool-result errors use another hook.
@@ -319,6 +335,39 @@ mod tests {
         match event {
             AgentStreamEvent::Finish(_) => {}
             other => panic!("Expected Finish, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn autocompact_failure_warns_without_ending_the_stream() {
+        let (sink, mut rx) = make_sink();
+        let message = "Autocompact failed: Stream error: connection interrupted";
+        sink.emit_error(message);
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::Tips(data) => {
+                assert_eq!(data.content, message);
+                assert_eq!(data.tip_type, TipType::Warning);
+            }
+            other => panic!("Expected warning, got {:?}", other),
+        }
+        assert!(!sink.session_save_failure_flag().load(Ordering::Acquire));
+
+        sink.emit_text_delta("continued", "msg-1");
+        sink.emit_stream_end("msg-1", 1, 10, 5, 0, 0);
+        assert!(matches!(rx.try_recv().unwrap(), AgentStreamEvent::Text(_)));
+        assert!(matches!(rx.try_recv().unwrap(), AgentStreamEvent::Finish(_)));
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn session_save_failure_still_emits_terminal_error() {
+        let (sink, mut rx) = make_sink();
+        let message = "Failed to save session: fixture disk failure";
+        sink.emit_error(message);
+        assert!(sink.session_save_failure_flag().load(Ordering::Acquire));
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::Error(data) => assert_eq!(data.message, message),
+            other => panic!("Expected terminal error, got {:?}", other),
         }
     }
 

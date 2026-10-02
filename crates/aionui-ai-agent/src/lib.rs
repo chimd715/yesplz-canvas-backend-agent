@@ -47,6 +47,8 @@ pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashC
 // conversation whose agent task is not currently live.
 pub use aionui_session::backend_supports_midturn_delivery;
 pub use aionui_session::effective_agent_capabilities;
+#[cfg(feature = "test-support")]
+pub use capability::backend_output_sink::BackendOutputSink;
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
