@@ -6,11 +6,12 @@
 
 use async_trait::async_trait;
 
-/// Notified before a conversation row is deleted via
+/// Notified after a conversation is tombstoned via
 /// `ConversationService::delete`.
 ///
-/// Implementors are responsible for cleaning up their per-conversation state
-/// (kill agent processes, drop cron job state, etc.). Hooks run sequentially
+/// Stop live work and clear presentation state; retain persisted conversation
+/// content, sessions, cron history and workspace files for internal analytics.
+/// Customer repository lookups already hide the row. Hooks run sequentially
 /// in registration order; failures must be logged inside the hook and not
 /// propagated.
 #[async_trait]

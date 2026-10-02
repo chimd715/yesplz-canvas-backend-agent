@@ -19,6 +19,12 @@ pub trait IFileService: Send + Sync {
     /// Check the caller's ownership when a legacy path names a managed upload.
     fn authorize_managed_upload_path(&self, user_id: &str, path: &Path) -> Result<(), FileError>;
 
+    /// Reject a conversation-bound Upload reference when its conversation is hidden.
+    /// Composition-backed implementations must authorize it against active rows.
+    async fn authorize_upload_reference(&self, _user_id: &str, _path: &Path) -> Result<(), FileError> {
+        Err(FileError::Internal("upload authorization is unavailable".to_owned()))
+    }
+
     // -- Content endpoint (pre-resolved absolute paths) --
     //
     // The caller (preview content endpoint) has already resolved a `ChatFileRef`

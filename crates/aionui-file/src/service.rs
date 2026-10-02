@@ -594,6 +594,36 @@ impl crate::traits::IFileService for FileService {
         authorize_managed_upload_path(user_id, path)
     }
 
+    async fn authorize_upload_reference(&self, user_id: &str, path: &Path) -> Result<(), FileError> {
+        authorize_managed_upload_path(user_id, path)?;
+        let root = aionui_common::user_paths::user_upload_root(&std::env::temp_dir().join("aionui"), user_id)
+            .map_err(|_| FileError::TargetNotFound)?;
+        let canonical_path = std::fs::canonicalize(path).map_err(|_| FileError::TargetNotFound)?;
+        // Legacy local-default uploads predate conversation-scoped namespaces.
+        // Their existing path authorization is preserved, as for host/project refs.
+        let canonical_root = match std::fs::canonicalize(&root) {
+            Ok(root) if canonical_path.starts_with(&root) => root,
+            _ if user_id == "system_default_user" => return Ok(()),
+            _ => return Err(FileError::TargetNotFound),
+        };
+        let relative = canonical_path
+            .strip_prefix(canonical_root)
+            .map_err(|_| FileError::TargetNotFound)?;
+        let conversation_id = relative
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .ok_or(FileError::TargetNotFound)?;
+        if conversation_id == "general" {
+            return Ok(());
+        }
+        let authorizer = self
+            .upload_authorizer
+            .as_ref()
+            .ok_or_else(|| FileError::Internal("upload authorization is unavailable".to_owned()))?;
+        authorizer.authorize(user_id, conversation_id).await
+    }
+
     // -- Content endpoint (pre-resolved absolute paths) --
     //
     // These operate on a path already resolved + containment-checked upstream by

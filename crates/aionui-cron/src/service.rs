@@ -17,7 +17,7 @@ use aionui_db::{
     UpdateCronJobParams, UpsertSkillParams, models::AgentMetadataRow, resolve_agent_binding_from_rows,
     runtime_backend_for_agent,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::events::CronEventEmitter;
 
@@ -1584,109 +1584,25 @@ impl CronService {
         }
     }
 
-    pub async fn delete_jobs_by_conversation(&self, user_id: &str, conversation_id: &str) {
-        let workspace_to_clear = match self
-            .executor
-            .auto_workspace_to_delete_for_conversation(user_id, conversation_id)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    conversation_id,
-                    error = %err,
-                    "Failed to inspect deleted conversation workspace for cron cleanup"
-                );
-                return;
-            }
-        };
-
-        let Some(workspace_to_clear) = workspace_to_clear else {
-            debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
-            return;
-        };
-
-        self.clear_deleted_workspace_from_jobs(user_id, conversation_id, &workspace_to_clear)
-            .await;
-        debug!(conversation_id, "Conversation deleted; cron jobs are preserved");
-    }
-
-    async fn clear_deleted_workspace_from_jobs(&self, user_id: &str, conversation_id: &str, workspace_to_clear: &Path) {
+    /// Stop schedules targeting a deleted conversation while retaining job/run history.
+    pub async fn pause_jobs_by_deleted_conversation(&self, user_id: &str, conversation_id: &str) {
         let jobs = match self.repo.list_by_conversation_for_user(user_id, conversation_id).await {
             Ok(rows) => rows,
             Err(err) => {
-                error!(
-                    user_id,
-                    conversation_id,
-                    error = %err,
-                    "Failed to list cron jobs for deleted workspace cleanup"
-                );
+                error!(user_id, conversation_id, error = %err, "Failed to list jobs for deleted conversation");
                 return;
             }
         };
-
-        let mut cleared = 0usize;
         for row in jobs {
-            let Some(agent_config_json) = row.agent_config.as_deref() else {
-                continue;
-            };
-            let mut agent_config = match serde_json::from_str::<CronAgentConfig>(agent_config_json) {
-                Ok(config) => config,
-                Err(err) => {
-                    warn!(
-                        job_id = %row.id,
-                        conversation_id,
-                        error = %err,
-                        "Failed to parse cron agent config for deleted workspace cleanup"
-                    );
-                    continue;
-                }
-            };
-            if !agent_config
-                .workspace
-                .as_deref()
-                .is_some_and(|workspace| workspace_matches_path(workspace, workspace_to_clear))
-            {
-                continue;
-            }
-
-            agent_config.workspace = None;
-            let agent_config_json = match serde_json::to_string(&agent_config) {
-                Ok(value) => value,
-                Err(err) => {
-                    warn!(
-                        job_id = %row.id,
-                        conversation_id,
-                        error = %err,
-                        "Failed to serialize cron agent config for deleted workspace cleanup"
-                    );
-                    continue;
-                }
-            };
+            self.scheduler.cancel_job(&row.id);
             let params = UpdateCronJobParams {
-                agent_config: Some(Some(agent_config_json)),
+                enabled: Some(false),
+                next_run_at: Some(None),
                 ..Default::default()
             };
-            match self.repo.update_for_user(&row.user_id, &row.id, &params).await {
-                Ok(()) => cleared += 1,
-                Err(err) => {
-                    error!(
-                        job_id = %row.id,
-                        conversation_id,
-                        error = %err,
-                        "Failed to clear deleted workspace from cron job"
-                    );
-                }
+            if let Err(err) = self.repo.update_for_user(user_id, &row.id, &params).await {
+                error!(conversation_id, job_id = %row.id, error = %err, "Failed to pause deleted conversation schedule");
             }
-        }
-
-        if cleared > 0 {
-            info!(
-                conversation_id,
-                cleared,
-                workspace = %workspace_to_clear.display(),
-                "Cleared deleted conversation workspace from cron jobs"
-            );
         }
     }
 
@@ -2103,13 +2019,13 @@ fn fallback_full_auto_mode(runtime_agent_type: &str, backend_hint: Option<&str>)
 }
 
 // ---------------------------------------------------------------------------
-// OnConversationDelete implementation (cascade delete)
+// OnConversationDelete implementation (stop live work, retain history)
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
 impl aionui_common::OnConversationDelete for CronService {
     async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
-        self.delete_jobs_by_conversation(user_id, conversation_id).await;
+        self.pause_jobs_by_deleted_conversation(user_id, conversation_id).await;
     }
 }
 

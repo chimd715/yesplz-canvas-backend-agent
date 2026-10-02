@@ -367,7 +367,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
 
 /// Wired up by `aionui-app` so deleting a conversation tears down its
 /// agent process. Without this hook, ACP/aionrs subprocesses keep
-/// streaming events for a `conversation_id` whose DB row is already gone
+/// streaming events for a `conversation_id` whose DB row is already hidden
 /// (Sentry ELECTRON-1BD).
 #[async_trait]
 impl OnConversationDelete for WorkerTaskManagerImpl {

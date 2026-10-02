@@ -447,6 +447,13 @@ async fn open_system_file(
         )
         .await
         .map_err(chat_file_resolve_error)?;
+    if matches!(&req.file, aionui_api_types::ChatFileRef::Upload { .. }) {
+        state
+            .file_service
+            .authorize_upload_reference(&user.id, Path::new(&abs))
+            .await?;
+    }
+
     state.system_opener.open(&abs).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -492,6 +499,13 @@ async fn read_content(
         )
         .await
         .map_err(chat_file_resolve_error)?;
+    if matches!(&req.file, aionui_api_types::ChatFileRef::Upload { .. }) {
+        state
+            .file_service
+            .authorize_upload_reference(&user.id, Path::new(&abs))
+            .await?;
+    }
+
     let content = state
         .file_service
         .read_resolved_content(Path::new(&abs), req.encoding)
@@ -521,6 +535,13 @@ async fn write_content(
         )
         .await
         .map_err(chat_file_resolve_error)?;
+    if matches!(&req.file, aionui_api_types::ChatFileRef::Upload { .. }) {
+        state
+            .file_service
+            .authorize_upload_reference(&user.id, Path::new(&abs))
+            .await?;
+    }
+
     let path = Path::new(&abs);
 
     if let Some(expected) = parse_if_match(&headers) {
@@ -556,6 +577,13 @@ async fn content_metadata(
         )
         .await
         .map_err(chat_file_resolve_error)?;
+    if matches!(&req.file, aionui_api_types::ChatFileRef::Upload { .. }) {
+        state
+            .file_service
+            .authorize_upload_reference(&user.id, Path::new(&abs))
+            .await?;
+    }
+
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
     Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
 }
@@ -588,6 +616,13 @@ async fn stream_file(
         )
         .await
         .map_err(chat_file_resolve_error)?;
+    if matches!(&file_ref, aionui_api_types::ChatFileRef::Upload { .. }) {
+        state
+            .file_service
+            .authorize_upload_reference(&user.id, Path::new(&abs))
+            .await?;
+    }
+
     // ServeFile owns Range/If-Range/Content-Type; the path is already
     // containment-checked by resolve_chat_file_ref, so no re-sandbox here.
     let response = ServeFile::new(&abs)

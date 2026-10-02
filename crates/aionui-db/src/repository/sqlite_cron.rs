@@ -378,12 +378,13 @@ impl SqliteCronRepository {
             return Ok(());
         }
 
-        let owns_conversation: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
-                .bind(user_id)
-                .bind(conversation_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let owns_conversation: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE deleted_at IS NULL AND user_id = ? AND id = ?)",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
         if !owns_conversation {
             return Err(DbError::NotFound(format!("conversation '{conversation_id}'")));
         }

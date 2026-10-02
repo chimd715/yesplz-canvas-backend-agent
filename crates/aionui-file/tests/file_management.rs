@@ -261,3 +261,45 @@ async fn copy_directory_cannot_follow_a_symlink_to_another_users_upload() {
     assert!(!target.join("source/alias.txt").exists());
     fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn upload_reference_checks_the_bound_conversation_after_upload() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Authorizer(AtomicBool);
+    #[async_trait::async_trait]
+    impl aionui_file::IUploadAuthorizer for Authorizer {
+        async fn authorize(&self, _user: &str, conversation: &str) -> Result<(), aionui_file::FileError> {
+            assert_eq!(conversation, "retained-test-conversation");
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(aionui_file::FileError::NotFound("conversation not found".into()))
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let authorizer = Arc::new(Authorizer(AtomicBool::new(true)));
+    let svc = make_service(dir.path()).with_upload_authorizer(authorizer.clone());
+    let owner = aionui_common::generate_prefixed_id("user");
+    let path = svc
+        .create_upload_file(
+            &owner,
+            "retained.txt",
+            b"retained bytes",
+            Some("retained-test-conversation"),
+        )
+        .await
+        .unwrap();
+    svc.authorize_upload_reference(&owner, std::path::Path::new(&path))
+        .await
+        .unwrap();
+    authorizer.0.store(false, Ordering::SeqCst);
+    let err = svc
+        .authorize_upload_reference(&owner, std::path::Path::new(&path))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aionui_file::FileError::NotFound(ref message) if message == "conversation not found"));
+    assert_eq!(fs::read(&path).unwrap(), b"retained bytes");
+    let root = aionui_common::user_paths::user_upload_root(&std::env::temp_dir().join("aionui"), &owner).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}

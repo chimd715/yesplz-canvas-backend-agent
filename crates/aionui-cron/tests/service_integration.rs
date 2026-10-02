@@ -3372,10 +3372,10 @@ async fn cd1_delete_by_conversation_preserves_jobs() {
 
     bc.take_events();
 
-    svc.delete_jobs_by_conversation("u1", "conv_cascade").await;
+    svc.pause_jobs_by_deleted_conversation("u1", "conv_cascade").await;
 
-    assert!(svc.get_job("u1", &job_a.id).await.is_ok());
-    assert!(svc.get_job("u1", &job_b.id).await.is_ok());
+    assert!(!svc.get_job("u1", &job_a.id).await.unwrap().enabled);
+    assert!(!svc.get_job("u1", &job_b.id).await.unwrap().enabled);
 
     let remaining = svc.list_jobs("u1", &ListCronJobsQuery::default()).await.unwrap();
     assert_eq!(remaining.len(), 3, "all cron jobs should remain");
@@ -3399,7 +3399,7 @@ async fn cd2_delete_by_conversation_no_matching_jobs() {
         .unwrap();
     bc.take_events();
 
-    svc.delete_jobs_by_conversation("u1", "conv_nonexistent").await;
+    svc.pause_jobs_by_deleted_conversation("u1", "conv_nonexistent").await;
 
     let events = bc.take_events();
     assert!(events.is_empty(), "no events should be emitted when no jobs match");
@@ -3430,7 +3430,7 @@ async fn cd3_on_conversation_delete_trait_preserves_jobs() {
 }
 
 #[tokio::test]
-async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
+async fn cd3b_on_conversation_delete_retains_workspace_and_pauses_jobs() {
     use aionui_common::OnConversationDelete;
 
     let (svc, cron_repo, bc, conv_repo, conv_service) = setup_with_conv_runtime().await;
@@ -3472,17 +3472,19 @@ async fn cd3b_on_conversation_delete_clears_deleted_workspace_from_jobs() {
     assert!(svc.get_job("u1", &job.id).await.is_ok());
     let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
-    assert!(
-        config.workspace.is_none(),
-        "cron job should drop workspace cached from the deleted conversation"
+    assert_eq!(
+        config.workspace.as_deref(),
+        Some(deleted_workspace_path.to_str().unwrap())
     );
+    assert!(!row.enabled, "deleted conversation schedules must stop");
+    assert!(row.next_run_at.is_none());
 
     let events = bc.take_events();
     assert!(events.is_empty());
 }
 
 #[tokio::test]
-async fn cd3b_on_conversation_delete_only_clears_current_user_jobs() {
+async fn cd3b_on_conversation_delete_only_pauses_current_user_jobs() {
     use aionui_common::OnConversationDelete;
 
     let (svc, cron_repo, _bc, conv_repo, conv_service) = setup_with_conv_runtime().await;
@@ -3528,16 +3530,15 @@ async fn cd3b_on_conversation_delete_only_clears_current_user_jobs() {
         .unwrap()
         .unwrap();
     let u1_config: CronAgentConfig = serde_json::from_str(u1_row.agent_config.as_deref().unwrap()).unwrap();
-    assert!(
-        u1_config.workspace.is_none(),
-        "deleted conversation owner job should drop cached workspace"
-    );
+    assert_eq!(u1_config.workspace.as_deref(), Some(deleted_workspace.as_str()));
+    assert!(!u1_row.enabled, "owner schedule must pause");
 
     let u2_row = cron_repo
         .get_by_id_system("cron_workspace_scope_u2")
         .await
         .unwrap()
         .unwrap();
+    assert!(u2_row.enabled, "other owner schedule remains enabled");
     let u2_config: CronAgentConfig = serde_json::from_str(u2_row.agent_config.as_deref().unwrap()).unwrap();
     assert_eq!(
         u2_config.workspace.as_deref(),

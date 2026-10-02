@@ -46,7 +46,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.agentId'), json_extract(extra, '$.agent_id')) END AS extra_agent_id, \
                 CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.teamId'), json_extract(extra, '$.team_id')) END AS extra_team_id \
              FROM conversations \
-             WHERE id = ? AND user_id = ?",
+             WHERE deleted_at IS NULL AND id = ? AND user_id = ?",
         )
         .bind(conversation_id)
         .bind(&request.user_id)
@@ -111,7 +111,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL)) \
              GROUP BY c.type, c.status \
@@ -171,7 +171,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? AND c.updated_at >= ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND c.updated_at >= ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL)) \
              ORDER BY CASE WHEN c.id = ? THEN 0 ELSE 1 END, c.updated_at DESC, c.id DESC \
@@ -223,7 +223,7 @@ impl SqliteFeedbackDiagnosticsRepository {
             "SELECT m.type, m.status, m.hidden, COUNT(*) AS count, SUM(length(m.content)) AS content_bytes \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
              GROUP BY m.type, m.status, m.hidden",
         )
         .bind(user_id)
@@ -262,7 +262,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.toolCalls') END AS tool_call_count \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 20",
         )
@@ -302,7 +302,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.feedbackRecommended') END AS feedback_recommended \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
                AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
@@ -340,7 +340,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(m.content) THEN COALESCE(json_extract(m.content, '$.error.retryable'), json_extract(m.content, '$.retryable')) END AS retryable \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
                AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT 10",
@@ -406,7 +406,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(s.session_config) THEN json_extract(s.session_config, '$.runtime.current_model_id') END AS current_model_id \
              FROM acp_session s \
              JOIN conversations c ON c.id = s.conversation_id \
-             WHERE c.user_id = ? AND s.conversation_id = ?",
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND s.conversation_id = ?",
         )
         .bind(user_id)
         .bind(conversation_id)
@@ -499,7 +499,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 length(cas.rules_content) AS rules_content_bytes, cas.created_at, cas.updated_at \
              FROM conversation_assistant_snapshots cas \
              JOIN conversations c ON c.id = cas.conversation_id \
-             WHERE cas.conversation_id = ? AND c.user_id = ?",
+             WHERE cas.conversation_id = ? AND c.deleted_at IS NULL AND c.user_id = ?",
         )
         .bind(conversation_id)
         .bind(user_id)
@@ -603,7 +603,7 @@ impl SqliteFeedbackDiagnosticsRepository {
         let provider_id: Option<String> = sqlx::query_scalar(
             "SELECT CASE WHEN json_valid(model) THEN COALESCE(json_extract(model, '$.providerId'), json_extract(model, '$.provider_id')) END \
              FROM conversations \
-             WHERE id = ? AND user_id = ?",
+             WHERE deleted_at IS NULL AND id = ? AND user_id = ?",
         )
         .bind(conversation_id)
         .bind(&request.user_id)
@@ -698,7 +698,7 @@ impl SqliteFeedbackDiagnosticsRepository {
         let team_id: Option<String> = sqlx::query_scalar(
             "SELECT CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.teamId'), json_extract(extra, '$.team_id')) END \
              FROM conversations \
-             WHERE id = ? AND user_id = ?",
+             WHERE deleted_at IS NULL AND id = ? AND user_id = ?",
         )
         .bind(conversation_id)
         .bind(&request.user_id)
@@ -881,7 +881,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.teamId'), json_extract(extra, '$.team_id')) END AS extra_team_id, \
                 CASE WHEN json_valid(extra) THEN COALESCE(json_extract(extra, '$.workspace'), json_extract(extra, '$.workspacePath'), json_extract(extra, '$.workspace_path')) END AS extra_workspace \
              FROM conversations \
-             WHERE id = ? AND user_id = ?",
+             WHERE deleted_at IS NULL AND id = ? AND user_id = ?",
         )
         .bind(conversation_id)
         .bind(&request.user_id)
@@ -963,7 +963,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL))",
         )
@@ -978,7 +978,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL))",
         )
@@ -1026,7 +1026,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL)) \
              GROUP BY c.type, c.status \
@@ -1125,7 +1125,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN acp_session s ON s.conversation_id = c.id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL)) \
              ORDER BY c.updated_at DESC, c.id DESC \
@@ -1287,7 +1287,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(m.content) THEN json_extract(m.content, '$.feedbackRecommended') END AS feedback_recommended \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
                AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ?",
@@ -1334,7 +1334,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 CASE WHEN json_valid(m.content) THEN json_array_length(m.content, '$.toolCalls') END AS tool_call_count \
              FROM messages m \
              JOIN conversations c ON c.id = m.conversation_id \
-             WHERE c.user_id = ? AND m.conversation_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? AND m.conversation_id = ? \
                AND NOT (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ?",
@@ -1391,7 +1391,7 @@ impl SqliteFeedbackDiagnosticsRepository {
              LEFT JOIN assistant_definitions ad ON ad.id = cas.assistant_definition_id \
              LEFT JOIN teams t ON t.id = CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END \
                 AND t.user_id = c.user_id \
-             WHERE c.user_id = ? \
+             WHERE c.deleted_at IS NULL AND c.user_id = ? \
                AND (CASE WHEN json_valid(c.extra) THEN COALESCE(json_extract(c.extra, '$.teamId'), json_extract(c.extra, '$.team_id')) END IS NULL OR t.id IS NOT NULL) \
                AND (cas.conversation_id IS NULL OR (ad.id IS NOT NULL AND ad.deleted_at IS NULL)) \
                AND (m.status = 'error' OR m.type = 'tips' OR (json_valid(m.content) AND json_extract(m.content, '$.error.code') IS NOT NULL)) \

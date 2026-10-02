@@ -2695,7 +2695,7 @@ async fn delete_invokes_registered_hook() {
 }
 
 #[tokio::test]
-async fn delete_invokes_registered_hook_before_row_delete() {
+async fn delete_invokes_registered_hook_after_customer_access_is_hidden() {
     use aionui_common::OnConversationDelete;
 
     struct RowVisibleHook {
@@ -2723,13 +2723,13 @@ async fn delete_invokes_registered_hook_before_row_delete() {
 
     {
         let observations = hook.observations.lock().unwrap();
-        assert_eq!(observations.as_slice(), &[true]);
+        assert_eq!(observations.as_slice(), &[false]);
     }
     assert!(repo.get("user_1", &conv.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
-async fn delete_removes_auto_provisioned_workspace_directory() {
+async fn delete_preserves_auto_provisioned_workspace_directory() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
@@ -2745,11 +2745,11 @@ async fn delete_removes_auto_provisioned_workspace_directory() {
 
     svc.delete("user_1", &conv.id).await.unwrap();
 
-    assert!(!Path::new(workspace).exists());
+    assert!(Path::new(workspace).is_dir());
 }
 
 #[tokio::test]
-async fn delete_removes_empty_date_workspace_parents() {
+async fn delete_preserves_workspace_date_parents() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
@@ -2776,9 +2776,11 @@ async fn delete_removes_empty_date_workspace_parents() {
 
     svc.delete("user_1", &second.id).await.unwrap();
 
-    assert!(!day_dir.exists());
-    assert!(!month_dir.exists());
-    assert!(!year_dir.exists());
+    assert!(day_dir.is_dir());
+    assert!(month_dir.is_dir());
+    assert!(year_dir.is_dir());
+    assert!(first_workspace.is_dir());
+    assert!(second_workspace.is_dir());
 }
 
 #[tokio::test]

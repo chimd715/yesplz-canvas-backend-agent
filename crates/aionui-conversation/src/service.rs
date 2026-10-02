@@ -2570,111 +2570,36 @@ impl ConversationService {
             .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
     }
 
-    /// Delete a conversation (messages cascade via FK).
-    ///
-    /// Broadcasts `conversation.listChanged(deleted)`.
+    /// Hide a conversation from customer access, retaining its persisted content
+    /// and workspace for internal analytics. Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
-        // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
             .get(user_id, id)
             .await?
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
-
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
-        let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
-        // Shared-workspace guard: a forked conversation inherits the parent's
-        // auto workspace verbatim (claude keys on-disk sessions by cwd), so
-        // deleting the parent must not rip the directory out from under the
-        // fork. Checked BEFORE the row delete (`list_associated` reads the
-        // source row). Fails closed: an error keeps the workspace.
-        if auto_workspace_to_delete.is_some() {
-            match self.conversation_repo.list_associated(user_id, id).await {
-                Ok(rows) if !rows.is_empty() => {
-                    info!(
-                        conversation_id = %id,
-                        remaining_references = rows.len(),
-                        "Skipping auto-workspace removal: other conversations still share it"
-                    );
-                    auto_workspace_to_delete = None;
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(
-                        conversation_id = %id,
-                        error = %ErrorChain(&err),
-                        "Shared-workspace check failed; keeping the workspace to be safe"
-                    );
-                    auto_workspace_to_delete = None;
-                }
-            }
-        }
-
         let had_active_turn = self.runtime_state.mark_deleting(id);
-
-        // Snapshot the hook list under the read lock, then drop the guard
-        // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
-        // across `.await` would make this future non-`Send`.
+        if let Err(err) = self.conversation_repo.delete(user_id, id).await {
+            self.runtime_state.clear_deleting(id);
+            return Err(err.into());
+        }
+        // The row is now hidden: hooks stop runtime work and remove presentation
+        // state, but must retain messages, sessions, artifacts and workspace files.
         let hooks: Vec<Arc<dyn OnConversationDelete>> =
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
             hook.on_conversation_deleted(user_id, id).await;
         }
-
-        // Drop the skill view while the row still exists: nothing downstream
-        // knows the (user, conversation) pair once it is gone, and a leaked view
-        // then waits for the next startup sweep.
-        self.skill_resolver.remove_skill_view(user_id, id).await;
-
-        if let Err(err) = self.conversation_repo.delete(user_id, id).await {
-            self.runtime_state.clear_deleting(id);
-            return Err(err.into());
-        }
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
         }
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
-        }
-        if let Some(workspace) = auto_workspace_to_delete {
-            let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
-                Ok(()) => {
-                    info!(
-                        conversation_id = %id,
-                        workspace = %workspace.display(),
-                        "Deleted auto-provisioned conversation workspace"
-                    );
-                    true
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-                Err(err) => {
-                    warn!(
-                        conversation_id = %id,
-                        workspace = %workspace.display(),
-                        error = %err,
-                        "Failed to delete auto-provisioned conversation workspace"
-                    );
-                    false
-                }
-            };
-            if workspace_removed {
-                cleanup_empty_date_workspace_parents(&self.workspace_root, &workspace).await;
-            }
-        }
-
-        info!("Conversation deleted");
+        info!("Conversation hidden; persisted content retained");
         self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
-
         Ok(())
     }
 
@@ -5222,73 +5147,6 @@ pub fn is_temp_session_workspace(workspace: &Path) -> bool {
         .file_name()
         .and_then(|leaf| leaf.to_str())
         .is_some_and(is_temp_leaf)
-}
-
-async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
-    let Some(date_dirs) = date_workspace_parent_dirs(workspace_root, workspace_path) else {
-        return;
-    };
-
-    for dir in date_dirs {
-        match tokio::fs::remove_dir(&dir).await {
-            Ok(()) => {}
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-                ) =>
-            {
-                break;
-            }
-            Err(err) => {
-                warn!(
-                    workspace_parent = %dir.display(),
-                    error = %err,
-                    "Failed to remove empty auto-provisioned workspace date directory"
-                );
-                break;
-            }
-        }
-    }
-}
-
-fn date_workspace_parent_dirs(workspace_root: &Path, workspace_path: &Path) -> Option<[PathBuf; 3]> {
-    let conversations_root = std::fs::canonicalize(workspace_root.join("conversations")).ok()?;
-    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
-    if !is_dated_auto_workspace_relative_path(relative) {
-        return None;
-    }
-
-    let day_dir = workspace_path.parent()?.to_path_buf();
-    let month_dir = day_dir.parent()?.to_path_buf();
-    let year_dir = month_dir.parent()?.to_path_buf();
-    Some([day_dir, month_dir, year_dir])
-}
-
-fn is_dated_auto_workspace_relative_path(relative: &Path) -> bool {
-    let parts = relative.iter().map(|part| part.to_str()).collect::<Option<Vec<_>>>();
-    let Some(parts) = parts else {
-        return false;
-    };
-
-    // Per-user, type-first layout: users/{user_dir}/{Y}/{M}/{D}/{file}. The
-    // legacy userless {Y}/{M}/{D}/{file} form is still accepted so old
-    // conversations' empty date dirs are pruned on delete.
-    let dated = |year: &str, month: &str, day: &str| {
-        year.len() == 4
-            && month.len() == 2
-            && day.len() == 2
-            && year.chars().all(|ch| ch.is_ascii_digit())
-            && month.chars().all(|ch| ch.is_ascii_digit())
-            && day.chars().all(|ch| ch.is_ascii_digit())
-    };
-    matches!(
-        parts.as_slice(),
-        [year, month, day, _file_name] if dated(year, month, day)
-    ) || matches!(
-        parts.as_slice(),
-        ["users", _user_dir, year, month, day, _file_name] if dated(year, month, day)
-    )
 }
 
 fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {

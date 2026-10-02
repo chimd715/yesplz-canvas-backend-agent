@@ -1157,3 +1157,44 @@ async fn workspace_summary_uses_existing_conversation_and_team_context() {
     assert_eq!(profile.data["team"]["workspace"], "/tmp/team-workspace");
     assert_eq!(profile.data["runtime_checks"]["path_exists"], serde_json::Value::Null);
 }
+
+#[tokio::test]
+async fn customer_diagnostics_exclude_retained_deleted_conversations() {
+    let db = init_database_memory().await.unwrap();
+    insert_feedback_fixture(&db).await;
+    let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
+    sqlx::query("UPDATE conversations SET deleted_at = 123 WHERE id = 'conv-auth'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let result = repo
+        .collect_feedback_diagnostics(&FeedbackDiagnosticsRequest {
+            user_id: "system_default_user".to_owned(),
+            profiles: vec![
+                FeedbackDiagnosticsProfile::ConversationSession,
+                FeedbackDiagnosticsProfile::WorkspaceSummary,
+                FeedbackDiagnosticsProfile::AgentTeam,
+                FeedbackDiagnosticsProfile::GlobalSummary,
+            ],
+            context: FeedbackDiagnosticsDbContext {
+                conversation_id: Some("conv-auth".to_owned()),
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    let conversation = result
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "conversation-session")
+        .unwrap();
+    assert_eq!(conversation.mode, "not_found");
+    assert!(conversation.data["conversation"].is_null());
+    assert!(!serde_json::to_string(&result).unwrap().contains("conv-auth"));
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = 'conv-auth' AND deleted_at IS NOT NULL")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained, 1);
+}

@@ -67,7 +67,7 @@ impl ISidebarStore for SqliteSidebarStore {
                     COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) AS team_id, \
                     updated_at, created_at \
              FROM conversations \
-             WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
+             WHERE deleted_at IS NULL AND user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
         );
         let rows = sqlx::query(&sql).bind(user_id).fetch_all(&self.pool).await?;
 
@@ -141,7 +141,7 @@ impl ISidebarStore for SqliteSidebarStore {
         let archived = archived_predicate(scope);
         let sql = format!(
             "SELECT * FROM conversations \
-             WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP} AND id IN ({})",
+             WHERE deleted_at IS NULL AND user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP} AND id IN ({})",
             placeholders(ids.len())
         );
         let mut query = sqlx::query_as::<_, ConversationRow>(&sql);
@@ -153,12 +153,13 @@ impl ISidebarStore for SqliteSidebarStore {
     }
 
     async fn set_conversation_archived(&self, user_id: &str, id: &str, at: Option<i64>) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE conversations SET archived_at = ? WHERE user_id = ? AND id = ?")
-            .bind(at)
-            .bind(user_id)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let result =
+            sqlx::query("UPDATE conversations SET archived_at = ? WHERE deleted_at IS NULL AND user_id = ? AND id = ?")
+                .bind(at)
+                .bind(user_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -179,7 +180,7 @@ impl ISidebarStore for SqliteSidebarStore {
         // BR-22), so the whole folded unit moves together.
         sqlx::query(
             "UPDATE conversations SET archived_at = ? \
-             WHERE user_id = ? \
+             WHERE deleted_at IS NULL AND user_id = ? \
                AND COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) = ?",
         )
         .bind(at)

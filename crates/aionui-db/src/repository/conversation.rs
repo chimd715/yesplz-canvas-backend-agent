@@ -18,10 +18,10 @@ use crate::models::{
 pub trait IConversationRepository: Send + Sync {
     // ── Conversation CRUD ───────────────────────────────────────────
 
-    /// Returns a conversation by user and ID, or `None` if not found.
+    /// Returns a conversation by user and ID, or `None` if missing or customer-deleted.
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError>;
 
-    /// Returns the owner user ID for a conversation, or `None` if the conversation does not exist.
+    /// Returns the owner user ID for a conversation, or `None` if the conversation is missing or customer-deleted.
     async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError>;
 
     /// Inserts a new conversation row.
@@ -30,8 +30,9 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
-    /// Deletes a conversation (messages cascade via FK).
-    /// Returns `DbError::NotFound` if ID is missing for the user.
+    /// Tombstones a conversation while retaining all persisted content for internal analytics.
+    /// Customer reads and writes must exclude tombstones; deletion cannot be undone.
+    /// Returns `DbError::NotFound` if missing, already deleted, or owned by another user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
     /// Lists conversations with cursor-based pagination and optional filters.
@@ -93,7 +94,8 @@ pub trait IConversationRepository: Send + Sync {
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
-    /// Every live `(user_id, id)` pair, across all users.
+    /// Every retained `(user_id, id)` pair, including tombstones, across all users.
+    /// Trusted startup maintenance only; never use this scan for customer access.
     ///
     /// Ids only, deliberately: the one caller is the startup sweep that reaps
     /// per-conversation skill view directories whose conversation is gone, and

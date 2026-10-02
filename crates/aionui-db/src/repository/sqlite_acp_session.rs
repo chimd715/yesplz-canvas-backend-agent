@@ -193,7 +193,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let row = sqlx::query_as::<_, AcpSessionRow>(
             "SELECT a.* FROM acp_session a \
              WHERE a.conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(conversation_id)
         .bind(user_id)
@@ -210,7 +210,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
                  session_id, session_status, session_config, last_active_at) \
              SELECT c.id, ?, ?, NULL, 'idle', '{}', ? \
              FROM conversations c \
-             WHERE c.id = ? AND c.user_id = ?",
+             WHERE c.id = ? AND c.deleted_at IS NULL AND c.user_id = ?",
         )
         .bind(params.agent_source)
         .bind(params.agent_id)
@@ -228,10 +228,12 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         })?;
 
         if result.rows_affected() == 0 {
-            let conversation_owner = sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
-                .bind(params.conversation_id)
-                .fetch_optional(&self.pool)
-                .await?;
+            let conversation_owner = sqlx::query_scalar::<_, String>(
+                "SELECT user_id FROM conversations WHERE deleted_at IS NULL AND id = ?",
+            )
+            .bind(params.conversation_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
             if conversation_owner
                 .as_deref()
@@ -269,7 +271,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let result = sqlx::query(
             "UPDATE acp_session SET session_id = ?, last_active_at = ? \
              WHERE conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(session_id)
         .bind(now)
@@ -285,7 +287,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let result = sqlx::query(
             "UPDATE acp_session SET session_id = NULL, last_active_at = ? \
              WHERE conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(now)
         .bind(conversation_id)
@@ -299,7 +301,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let result = sqlx::query(
             "DELETE FROM acp_session \
              WHERE conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(conversation_id)
         .bind(user_id)
@@ -316,7 +318,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let raw: Option<String> = sqlx::query_scalar(
             "SELECT a.session_config FROM acp_session a \
              WHERE a.conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(conversation_id)
         .bind(user_id)
@@ -343,7 +345,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let raw: Option<String> = sqlx::query_scalar(
             "SELECT a.session_config FROM acp_session a \
              WHERE a.conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = a.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(conversation_id)
         .bind(user_id)
@@ -359,7 +361,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         let result = sqlx::query(
             "UPDATE acp_session SET session_config = ?, last_active_at = ? \
              WHERE conversation_id = ? \
-               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.deleted_at IS NULL AND c.user_id = ?)",
         )
         .bind(new_config)
         .bind(now)

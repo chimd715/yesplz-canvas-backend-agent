@@ -1627,3 +1627,92 @@ async fn upload_ownership_cannot_be_bypassed_by_local_refs_legacy_paths_or_alias
     assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn retained_deleted_conversation_rejects_new_uploads_and_bound_upload_references() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "retained-upload-owner", "StrongP@ss1").await;
+    let owner = services
+        .user_repo
+        .find_by_username("retained-upload-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let req =
+        serde_json::from_value(json!({"type":"acp","extra":{"workspace":workspace.path().to_str().unwrap()}})).unwrap();
+    let conversation = services.conversation_service.create(&owner.id, req).await.unwrap();
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "retained.txt", "text/plain", b"retained upload bytes")
+        .add_text("conversation_id", &conversation.id)
+        .build();
+    let response = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let path = body_json(response).await["data"].as_str().unwrap().to_owned();
+    let file = json!({"file":{"kind":"upload","path":path}, "encoding":"utf8"});
+    let response = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/fs/content", file.clone(), &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"], "retained upload bytes");
+    services
+        .conversation_service
+        .delete(&owner.id, &conversation.id)
+        .await
+        .unwrap();
+    assert!(
+        path.contains(&conversation.id),
+        "bound upload must use its conversation directory: {path}"
+    );
+    assert!(
+        services
+            .conversation_repo
+            .get(&owner.id, &conversation.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "composition repository must hide the tombstone"
+    );
+    for (method, endpoint, body) in [
+        ("POST", "/api/fs/content", file.clone()),
+        ("PUT", "/api/fs/content", json!({"file":file["file"], "data":"replace"})),
+        ("POST", "/api/fs/content/metadata", json!({"file":file["file"]})),
+        ("POST", "/api/fs/open-system", json!({"file":file["file"]})),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(method, endpoint, body, &token, &csrf))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {endpoint}");
+        let response = body_json(response).await;
+        assert_eq!(response["code"], "NOT_FOUND");
+        assert_eq!(response["error"], "conversation not found");
+    }
+    let uri = format!("/api/fs/stream?kind=upload&path={path}");
+    let response = app
+        .clone()
+        .oneshot(get_with_token(&uri, &token, &csrf, None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["error"], "conversation not found");
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "new.txt", "text/plain", b"new bytes")
+        .add_text("conversation_id", &conversation.id)
+        .build();
+    let response = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["error"], "conversation not found");
+    assert_eq!(std::fs::read(&path).unwrap(), b"retained upload bytes");
+    std::fs::remove_file(path).unwrap();
+}

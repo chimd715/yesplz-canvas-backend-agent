@@ -295,7 +295,7 @@ impl IChannelRepository for SqliteChannelRepository {
              )
              AND (
                  ? IS NULL OR EXISTS (
-                     SELECT 1 FROM conversations WHERE id = ? AND user_id = ?
+                     SELECT 1 FROM conversations WHERE deleted_at IS NULL AND id = ? AND user_id = ?
                  )
              )",
         )
@@ -365,7 +365,7 @@ impl IChannelRepository for SqliteChannelRepository {
                )
                AND EXISTS (
                    SELECT 1 FROM conversations c
-                   WHERE c.id = ? AND c.user_id = ?
+                   WHERE c.id = ? AND c.deleted_at IS NULL AND c.user_id = ?
                )",
         )
         .bind(conversation_id)
@@ -388,11 +388,12 @@ impl IChannelRepository for SqliteChannelRepository {
             .await?;
 
             if session_exists > 0 {
-                let conversation_owner =
-                    sqlx::query_scalar::<_, String>("SELECT user_id FROM conversations WHERE id = ?")
-                        .bind(conversation_id)
-                        .fetch_optional(&self.pool)
-                        .await?;
+                let conversation_owner = sqlx::query_scalar::<_, String>(
+                    "SELECT user_id FROM conversations WHERE id = ? AND deleted_at IS NULL",
+                )
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
 
                 if conversation_owner
                     .as_deref()

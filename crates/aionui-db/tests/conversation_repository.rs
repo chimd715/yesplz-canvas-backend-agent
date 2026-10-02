@@ -119,7 +119,7 @@ async fn create_get_update_delete_lifecycle() {
 }
 
 #[tokio::test]
-async fn delete_conversation_cascades_messages() {
+async fn delete_conversation_retains_messages() {
     let (repo, db) = setup().await;
     let conv = make_conversation("cascade");
     repo.create(&conv).await.unwrap();
@@ -144,7 +144,7 @@ async fn delete_conversation_cascades_messages() {
         .unwrap();
     assert_eq!(msgs.items.len(), 3);
 
-    // Delete conversation → messages cascade
+    // Customer deletion hides access while retaining messages for analytics.
     repo.delete(&conv.user_id, &conv.id).await.unwrap();
 
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
@@ -152,7 +152,7 @@ async fn delete_conversation_cascades_messages() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(remaining, 0);
+    assert_eq!(remaining, 3);
 }
 
 // ── Cursor pagination ───────────────────────────────────────────────
@@ -1462,4 +1462,172 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
         .await
         .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
+}
+
+#[tokio::test]
+async fn retained_delete_hides_every_customer_history_lookup_and_write() {
+    use aionui_db::{ArchiveScope, ISidebarStore, MentionableCandidatesParams, SqliteSidebarStore};
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let mut deleted = make_conversation("retained title");
+    deleted.channel_chat_id = Some("external-chat".into());
+    deleted.extra = r#"{"workspace":"/retained/workspace","cronJobId":"retained-job"}"#.into();
+    repo.create(&deleted).await.unwrap();
+    let survivor = make_conversation("survivor");
+    repo.create(&survivor).await.unwrap();
+    let mut message = make_message(&deleted.id, "analytics retained payload");
+    message.r#type = "tool_call".into();
+    repo.insert_message(USER_ID, &message).await.unwrap();
+    let artifact = make_artifact(&deleted.id, "retained-artifact");
+    repo.upsert_artifact(USER_ID, &artifact).await.unwrap();
+    let sidebar = SqliteSidebarStore::new(db.pool().clone());
+    assert!(matches!(
+        repo.delete("user_2", &deleted.id).await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(repo.get(USER_ID, &deleted.id).await.unwrap().is_some());
+    sidebar
+        .set_conversation_archived(USER_ID, &deleted.id, Some(12))
+        .await
+        .unwrap();
+    repo.delete(USER_ID, &deleted.id).await.unwrap();
+    assert!(matches!(
+        repo.delete(USER_ID, &deleted.id).await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(repo.get(USER_ID, &deleted.id).await.unwrap().is_none());
+    assert!(repo.owner_user_id(&deleted.id).await.unwrap().is_none());
+    let page = repo
+        .list_paginated(USER_ID, &ConversationFilters::default())
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.items[0].id, survivor.id);
+    assert!(
+        repo.list_mentionable_candidates(USER_ID, &MentionableCandidatesParams::default())
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.id != deleted.id)
+    );
+    assert!(
+        repo.find_by_source_and_chat(USER_ID, "aionui", "external-chat", "gemini")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(repo.list_by_cron_job(USER_ID, "retained-job").await.unwrap().is_empty());
+    assert!(matches!(
+        repo.list_associated(USER_ID, &deleted.id).await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(
+        repo.search_messages(USER_ID, "analytics", 0, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert!(
+        repo.get_message(USER_ID, &deleted.id, &message.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.get_artifact(USER_ID, &deleted.id, &artifact.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(repo.list_artifacts(USER_ID, &deleted.id).await.unwrap().is_empty());
+    assert!(matches!(
+        repo.list_messages_page(
+            USER_ID,
+            &deleted.id,
+            &MessagePageParams {
+                limit: 10,
+                direction: MessagePageDirection::InitialLatest
+            }
+        )
+        .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(matches!(
+        repo.update(
+            USER_ID,
+            &deleted.id,
+            &ConversationRowUpdate {
+                name: Some("restore?".into()),
+                ..Default::default()
+            }
+        )
+        .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(matches!(
+        repo.insert_message(USER_ID, &make_message(&deleted.id, "late insert"))
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(matches!(
+        repo.upsert_message(USER_ID, &message).await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(matches!(
+        repo.upsert_message("user_2", &make_message(&survivor.id, "foreign insert"))
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(matches!(
+        repo.copy_messages_up_to(USER_ID, &deleted.id, &survivor.id, (message.created_at, &message.id))
+            .await,
+        Err(DbError::NotFound(_))
+    ));
+    assert!(
+        !sidebar
+            .set_conversation_archived(USER_ID, &deleted.id, None)
+            .await
+            .unwrap()
+    );
+    for scope in [ArchiveScope::Active, ArchiveScope::Archived] {
+        assert!(
+            sidebar
+                .list_conversations_thin(USER_ID, scope)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.id != deleted.id)
+        );
+        assert!(
+            sidebar
+                .hydrate_conversations(USER_ID, &[deleted.id.clone()], scope)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    // Trusted server-side SQL can still analyze the original row and complete content.
+    let stored: (String, String, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT name, extra, deleted_at, archived_at FROM conversations WHERE id = ?")
+            .bind(&deleted.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.0, deleted.name);
+    assert_eq!(stored.1, deleted.extra);
+    assert!(stored.2.unwrap() > 0);
+    assert_eq!(stored.3, Some(12));
+    let retained: String = sqlx::query_scalar("SELECT content FROM messages WHERE id = ?")
+        .bind(&message.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained, message.content);
+    let retained_artifact: String = sqlx::query_scalar("SELECT payload FROM conversation_artifacts WHERE id = ?")
+        .bind(&artifact.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained_artifact, artifact.payload);
 }
