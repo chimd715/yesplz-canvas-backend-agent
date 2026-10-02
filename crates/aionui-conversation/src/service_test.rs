@@ -8917,26 +8917,87 @@ async fn create_with_no_skills_does_not_build_a_view() {
     assert!(views.lock().unwrap().is_empty());
 }
 
-/// Deleting a conversation must drop its view -- nothing else will, and the
-/// owner is only knowable while the row still exists.
+/// Customer deletion retains the skill snapshot and view for internal history,
+/// including startup cleanup, while refusing customer reads and runtime reuse.
 #[tokio::test]
-async fn deleting_a_conversation_removes_its_skill_view() {
+async fn deleting_a_conversation_retains_its_skill_view_without_customer_access() {
+    let user_id = "system_default_user";
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+    let workspace = tempfile::tempdir().unwrap();
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let views = resolver.views.clone();
     let removals = resolver.view_removals.clone();
-    let (svc, _broadcaster, _repo, _task_mgr) =
-        make_service_with_resolver_and_agent_metadata_repo(resolver, Arc::new(ClaudeNativeSkillMetadataRepo));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        workspace.path().to_path_buf(),
+        Arc::new(MockBroadcaster::new()),
+        resolver,
+        task_mgr.clone(),
+        repo.clone(),
+        Arc::new(ClaudeNativeSkillMetadataRepo),
+        Arc::new(aionui_db::SqliteAcpSessionRepository::new(db.pool().clone())),
+    );
 
     let req: CreateConversationRequest = serde_json::from_value(json!({
         "type": "acp",
-        "extra": { "workspace": ensure_test_workspace_path(), "backend": "claude" },
+        "extra": { "workspace": workspace.path(), "backend": "claude" },
     }))
     .unwrap();
-    let resp = svc.create("user-1", req).await.unwrap();
-    svc.delete("user-1", &resp.id).await.unwrap();
+    let resp = svc.create(user_id, req).await.unwrap();
+    assert_eq!(views.lock().unwrap().len(), 1);
 
-    let calls = removals.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0], ("user-1".to_owned(), resp.id.clone()));
+    // The recording resolver does not write a view, so create a harmless file
+    // to exercise the real startup cleanup against the retained database row.
+    let view = aionui_extension::skill_view::view_dir(workspace.path(), user_id, &resp.id).unwrap();
+    tokio::fs::create_dir_all(&view).await.unwrap();
+    let retained_file = view.join("retained-history.txt");
+    tokio::fs::write(&retained_file, "retained skill history")
+        .await
+        .unwrap();
+
+    svc.delete(user_id, &resp.id).await.unwrap();
+
+    let (deleted_at, extra): (Option<i64>, String) =
+        sqlx::query_as("SELECT deleted_at, extra FROM conversations WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(&resp.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(deleted_at.is_some());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&extra).unwrap()["skills"],
+        json!(["cron"])
+    );
+    assert!(repo.get(user_id, &resp.id).await.unwrap().is_none());
+    assert!(repo.owner_user_id(&resp.id).await.unwrap().is_none());
+    assert!(matches!(
+        svc.get(user_id, &resp.id).await,
+        Err(ConversationError::NotFound { .. })
+    ));
+    assert!(matches!(
+        svc.warmup(user_id, &resp.id, &task_mgr).await,
+        Err(ConversationError::NotFound { .. })
+    ));
+    assert_eq!(
+        views.lock().unwrap().len(),
+        1,
+        "a deleted conversation cannot rebuild its view"
+    );
+    assert!(removals.lock().unwrap().is_empty());
+
+    let retained_ids = repo.list_all_conversation_ids().await.unwrap().into_iter().collect();
+    assert_eq!(
+        aionui_extension::skill_view::cleanup_orphan_views(workspace.path(), &retained_ids)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(retained_file).await.unwrap(),
+        "retained skill history"
+    );
 }
 
 /// Warmup re-syncs the view idempotently: build-task runs on every session open,
