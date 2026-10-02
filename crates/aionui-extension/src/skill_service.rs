@@ -3312,6 +3312,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_secure_secrets_is_auto_injected_without_plaintext_resolution() {
+        let location = "auto-inject/secure-secrets/SKILL.md";
+        let file = BUILTIN_SKILLS
+            .get_file(location)
+            .expect("secure-secrets must ship in the embedded corpus");
+        let embedded = std::str::from_utf8(file.contents()).expect("secure-secrets must be UTF-8");
+        let (name, description) =
+            parse_frontmatter_fields(embedded).expect("secure-secrets must have valid frontmatter");
+        assert_eq!(name, "secure-secrets");
+        assert!(description.chars().count() <= MAX_AUTO_INJECT_DESCRIPTION_CHARS);
+        assert!(embedded.contains("without a plaintext resolver"));
+        assert!(embedded.contains("Never attempt to resolve a reference"));
+        assert!(embedded.contains("Do not ask the user to paste a token into chat"));
+        assert!(embedded.contains("github_identity"));
+
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+        let injected = list_auto_inject_skills_from_disk(&paths).await.unwrap();
+        let skill = injected
+            .iter()
+            .find(|item| item.name == name)
+            .expect("secure-secrets must be auto-injected");
+        assert_eq!(skill.location, location);
+        assert_eq!(skill.description, description);
+        let materialized = read_builtin_skill(&paths, location).await.unwrap();
+        assert_eq!(
+            materialized, embedded,
+            "startup materialization must preserve secure guidance"
+        );
+    }
+
+    #[tokio::test]
     async fn embedded_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
