@@ -354,7 +354,7 @@ async fn t8_6_rejects_before_and_after_together() {
         .unwrap_err();
 
     assert!(
-        matches!(err, ConversationError::BadRequest { reason } if reason == "before, after, and anchor_message_id are mutually exclusive")
+        matches!(err, ConversationError::BadRequest { reason } if reason == "first, before, after, and anchor_message_id are mutually exclusive")
     );
 }
 
@@ -377,7 +377,7 @@ async fn t8_7_rejects_anchor_with_cursor() {
         .unwrap_err();
 
     assert!(
-        matches!(err, ConversationError::BadRequest { reason } if reason == "before, after, and anchor_message_id are mutually exclusive")
+        matches!(err, ConversationError::BadRequest { reason } if reason == "first, before, after, and anchor_message_id are mutually exclusive")
     );
 }
 
@@ -1263,4 +1263,114 @@ async fn get_projects_fork_capability_for_aionrs_on_detail_path() {
         Some(aionui_api_types::ForkCapabilityView { at_turn: true }),
         "detail path projects the aionrs fork capability via the builtin binding ladder"
     );
+}
+
+#[tokio::test]
+async fn t8_first_history_page_is_bounded_and_continues_forward() {
+    let (svc, repo, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    for index in 0..210 {
+        let mut row = make_message(&conv.id, &format!("item {index}"), index);
+        row.id = format!("edge-{index:03}");
+        row.created_at = 1000;
+        repo.insert_message(USER_ID, &row).await.unwrap();
+    }
+    let first = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                first: Some(true),
+                limit: Some(500),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 200);
+    assert_eq!(first.items[0].id, "edge-000");
+    assert_eq!(first.items[199].id, "edge-199");
+    assert!(!first.has_more_before);
+    assert!(first.has_more_after);
+    let next = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                after: first.newest_cursor,
+                limit: Some(50),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.items.len(), 10);
+    assert_eq!(next.items[0].id, "edge-200");
+    assert!(!next.has_more_after);
+    let latest = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                limit: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.items[0].id, "edge-207");
+    assert!(!latest.has_more_after);
+    assert!(latest.has_more_before);
+}
+
+#[tokio::test]
+async fn t8_first_history_page_preserves_scope_and_rejects_conflicting_locators() {
+    let (svc, _, _) = setup().await;
+    let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let unknown = svc
+        .list_messages(
+            "foreign-user",
+            &conv.id,
+            ListMessagesQuery {
+                first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(unknown, ConversationError::NotFound { .. }));
+    for query in [
+        ListMessagesQuery {
+            first: Some(true),
+            before: Some("invalid".into()),
+            ..Default::default()
+        },
+        ListMessagesQuery {
+            first: Some(true),
+            after: Some("invalid".into()),
+            ..Default::default()
+        },
+        ListMessagesQuery {
+            first: Some(true),
+            anchor_message_id: Some("id".into()),
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            matches!(svc.list_messages(USER_ID, &conv.id, query).await.unwrap_err(), ConversationError::BadRequest { reason } if reason == "first, before, after, and anchor_message_id are mutually exclusive")
+        );
+    }
+    let empty = svc
+        .list_messages(
+            USER_ID,
+            &conv.id,
+            ListMessagesQuery {
+                first: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(empty.items.is_empty());
+    assert!(!empty.has_more_after && !empty.has_more_before);
 }

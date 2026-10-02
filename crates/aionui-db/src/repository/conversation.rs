@@ -367,6 +367,7 @@ impl From<&MessageRow> for MessagePageCursor {
 /// Direction for cursor-based message pagination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessagePageDirection {
+    InitialFirst,
     InitialLatest,
     Before { cursor: MessagePageCursor },
     After { cursor: MessagePageCursor },

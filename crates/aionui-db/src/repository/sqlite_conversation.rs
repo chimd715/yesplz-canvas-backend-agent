@@ -827,6 +827,22 @@ impl IConversationRepository for SqliteConversationRepository {
         let fetch_limit = limit + 1;
 
         let mut rows = match &params.direction {
+            MessagePageDirection::InitialFirst => {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT m.* FROM messages m \
+                      INNER JOIN conversations c ON c.id = m.conversation_id \
+                      WHERE c.deleted_at IS NULL AND c.user_id = ? \
+                        AND m.conversation_id = ? \
+                        AND m.type NOT IN ('cron_trigger', 'skill_suggest') \
+                      ORDER BY m.created_at ASC, m.id ASC \
+                      LIMIT ?",
+                )
+                .bind(user_id)
+                .bind(conv_id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
             MessagePageDirection::InitialLatest => {
                 let mut rows = sqlx::query_as::<_, MessageRow>(
                     "SELECT m.* FROM messages m \

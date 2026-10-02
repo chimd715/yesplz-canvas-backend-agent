@@ -1631,3 +1631,51 @@ async fn retained_delete_hides_every_customer_history_lookup_and_write() {
         .unwrap();
     assert_eq!(retained_artifact, artifact.payload);
 }
+
+#[tokio::test]
+async fn first_history_page_orders_ties_filters_auxiliary_rows_and_preserves_scope() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let conv = make_conversation("first-history");
+    repo.create(&conv).await.unwrap();
+    for index in 0..125 {
+        let mut message = make_message(&conv.id, "history");
+        message.id = format!("history-{index:03}");
+        message.created_at = 1000;
+        if index == 0 {
+            message.r#type = "cron_trigger".into();
+        }
+        if index == 1 {
+            message.r#type = "skill_suggest".into();
+        }
+        repo.insert_message(USER_ID, &message).await.unwrap();
+    }
+    let params = MessagePageParams {
+        limit: 50,
+        direction: MessagePageDirection::InitialFirst,
+    };
+    let first = repo.list_messages_page(USER_ID, &conv.id, &params).await.unwrap();
+    assert_eq!(first.items.len(), 50);
+    assert_eq!(first.items[0].id, "history-002");
+    assert_eq!(first.items[49].id, "history-051");
+    assert!(!first.has_more_before && first.has_more_after);
+    assert!(matches!(
+        repo.list_messages_page("user_2", &conv.id, &params).await.unwrap_err(),
+        DbError::NotFound(_)
+    ));
+    let next = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &MessagePageParams {
+                limit: 50,
+                direction: MessagePageDirection::After {
+                    cursor: MessagePageCursor::from(first.items.last().unwrap()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.items.len(), 50);
+    assert_eq!(next.items[0].id, "history-052");
+}

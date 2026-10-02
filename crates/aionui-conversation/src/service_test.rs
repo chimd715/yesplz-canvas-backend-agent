@@ -463,6 +463,7 @@ impl IConversationRepository for MockRepo {
 
         let limit = params.limit.max(1) as usize;
         let items = match &params.direction {
+            MessagePageDirection::InitialFirst => matched.iter().take(limit).cloned().collect(),
             MessagePageDirection::InitialLatest => {
                 let start = matched.len().saturating_sub(limit);
                 matched[start..].to_vec()

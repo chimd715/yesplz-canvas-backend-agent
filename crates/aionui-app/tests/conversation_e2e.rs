@@ -1409,3 +1409,83 @@ async fn managed_native_policy_preserves_http_auth_csrf_ownership_and_model_busy
     assert_eq!(updated["data"]["model"]["use_model"], "z-ai/glm-5.3");
     services.database.close().await;
 }
+
+#[tokio::test]
+async fn history_first_page_http_enforces_auth_scope_and_bounded_navigation() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (foreign_token, _) = setup_and_login(&mut app, &services, "foreign", "StrongP@ss2").await;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            create_body("History edges"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    let id = created["data"]["id"].as_str().unwrap();
+    let repo = SqliteConversationRepository::new(services.database.pool().clone());
+    let owner = repo.owner_user_id(id).await.unwrap().unwrap();
+    for index in 0..125 {
+        repo.insert_message(
+            &owner,
+            &aionui_db::models::MessageRow {
+                id: format!("edge-{index:03}"),
+                conversation_id: id.into(),
+                msg_id: None,
+                r#type: "text".into(),
+                content: json!({"content":"history"}).to_string(),
+                position: Some("left".into()),
+                status: Some("finish".into()),
+                hidden: false,
+                created_at: 1000,
+                backend_turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let url = format!("/api/conversations/{id}/messages?first=true&limit=50&content_mode=compact");
+    assert_eq!(
+        app.clone().oneshot(get_request(&url)).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let denied = app.clone().oneshot(get_with_token(&url, &foreign_token)).await.unwrap();
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(denied).await["code"], "NOT_FOUND");
+    let first = app.clone().oneshot(get_with_token(&url, &token)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    let page = &first["data"];
+    assert_eq!(page["items"].as_array().unwrap().len(), 50);
+    assert_eq!(page["items"][0]["id"], "edge-000");
+    assert_eq!(page["has_more_before"], false);
+    assert_eq!(page["has_more_after"], true);
+    let cursor = page["newest_cursor"].as_str().unwrap();
+    let next = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{id}/messages?after={cursor}&limit=50"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    assert_eq!(body_json(next).await["data"]["items"][0]["id"], "edge-050");
+    let conflict = app
+        .clone()
+        .oneshot(get_with_token(&format!("{url}&after={cursor}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(conflict).await["code"], "BAD_REQUEST");
+    repo.delete(&owner, id).await.unwrap();
+    let deleted = app.oneshot(get_with_token(&url, &token)).await.unwrap();
+    assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(deleted).await["code"], "NOT_FOUND");
+}

@@ -3106,7 +3106,8 @@ fn effective_message_limit(limit: Option<u32>) -> u32 {
 }
 
 fn message_locator_count(query: &ListMessagesQuery) -> usize {
-    usize::from(query.before.is_some())
+    usize::from(query.first == Some(true))
+        + usize::from(query.before.is_some())
         + usize::from(query.after.is_some())
         + usize::from(query.anchor_message_id.is_some())
 }
@@ -3130,11 +3131,13 @@ impl ConversationService {
         let limit = effective_message_limit(query.limit);
         if message_locator_count(&query) > 1 {
             return Err(ConversationError::bad_request(
-                "before, after, and anchor_message_id are mutually exclusive",
+                "first, before, after, and anchor_message_id are mutually exclusive",
             ));
         }
 
-        let direction = if let Some(cursor) = query.before.as_deref() {
+        let direction = if query.first == Some(true) {
+            MessagePageDirection::InitialFirst
+        } else if let Some(cursor) = query.before.as_deref() {
             MessagePageDirection::Before {
                 cursor: decode_message_cursor(cursor)?,
             }

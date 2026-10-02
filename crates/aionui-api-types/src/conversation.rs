@@ -276,6 +276,8 @@ pub struct ListConversationsQuery {
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMessagesQuery {
     pub limit: Option<u32>,
+    /// Fetch the earliest bounded page instead of the default latest page.
+    pub first: Option<bool>,
     pub before: Option<String>,
     pub after: Option<String>,
     pub anchor_message_id: Option<String>,
