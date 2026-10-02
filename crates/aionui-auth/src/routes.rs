@@ -834,6 +834,12 @@ async fn refresh_handler(
     let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
         Some(cookie_token) => (cookie_token, true),
         None => {
+            // A browser's bodyless cookie refresh without a cookie is a missing
+            // credential, not a JSON content-type failure (415). Clients need an
+            // explicit 401 to distinguish signed-out sessions from outages.
+            if !headers.contains_key(header::CONTENT_TYPE) {
+                return Err(ApiError::Unauthorized("Missing refresh token".into()));
+            }
             let Json(req) = body.map_err(ApiError::from)?;
             (req.token, false)
         }

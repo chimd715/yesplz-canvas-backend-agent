@@ -1300,3 +1300,28 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
 }
+
+#[tokio::test]
+async fn refresh_without_cookie_or_body_is_unauthorized() {
+    let (app, _) = test_app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/refresh")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(json["error"], "Missing refresh token");
+}
+
+#[tokio::test]
+async fn refresh_with_empty_legacy_credential_is_unauthorized() {
+    let (app, _) = test_app().await;
+    let req = json_post("/api/auth/refresh", r#"{"token":""}"#);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
