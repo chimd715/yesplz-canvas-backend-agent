@@ -65,6 +65,9 @@ mod managed_customer_test;
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
+#[path = "service_test/generated_artifacts_test.rs"]
+mod generated_artifacts_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,

@@ -288,6 +288,11 @@ impl ConversationTurnOrchestrator {
                 self.service.conversation_repo().clone(),
                 self.service.broadcaster().clone(),
             )
+            .with_generated_artifacts(
+                (agent.agent_type() == AgentType::Aionrs)
+                    .then(|| self.service.project_service())
+                    .flatten(),
+            )
             .with_skill_resolver(self.service.skill_resolver())
             .with_allowed_skill_names(input.allowed_skill_names.clone())
             .with_runtime_state(Arc::clone(&runtime_state))

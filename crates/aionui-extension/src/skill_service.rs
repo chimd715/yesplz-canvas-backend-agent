@@ -3344,6 +3344,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_generated_artifact_preview_is_auto_injected_with_safe_document_contract() {
+        let location = "auto-inject/generated-artifact-preview/SKILL.md";
+        let embedded = BUILTIN_SKILLS
+            .get_file(location)
+            .expect("document preview skill must ship")
+            .contents_utf8()
+            .unwrap();
+        let (name, description) = parse_frontmatter_fields(embedded).expect("valid skill frontmatter");
+        assert_eq!(name, "generated-artifact-preview");
+        assert!(description.chars().count() <= MAX_AUTO_INJECT_DESCRIPTION_CHARS);
+        assert!(embedded.contains("Successful native `Write` calls automatically open"));
+        assert!(embedded.contains("`PublishArtifact`"));
+        assert!(embedded.contains("static and isolated"));
+        assert!(embedded.contains("Never publish tokens"));
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+        let skills = list_auto_inject_skills_from_disk(&paths).await.unwrap();
+        assert!(
+            skills
+                .iter()
+                .any(|skill| skill.name == name && skill.location == location)
+        );
+        assert_eq!(read_builtin_skill(&paths, location).await.unwrap(), embedded);
+    }
+
+    #[tokio::test]
     async fn embedded_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;

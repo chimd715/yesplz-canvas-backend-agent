@@ -99,9 +99,10 @@ pub use conversation::{
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    GeneratedFileArtifactPayload, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
+    MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

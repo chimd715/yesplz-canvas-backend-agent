@@ -396,6 +396,15 @@ pub struct ActiveCountResponse {
 pub enum ConversationArtifactKind {
     CronTrigger,
     SkillSuggest,
+    GeneratedFile,
+}
+
+/// Trusted workspace output. Files remain behind authenticated project I/O.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeneratedFileArtifactPayload {
+    pub project_id: String,
+    pub file: ChatFileRef,
+    pub file_name: String,
 }
 
 /// Durable artifact state exposed to the client.

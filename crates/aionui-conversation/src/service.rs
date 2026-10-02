@@ -477,6 +477,10 @@ impl ConversationService {
         }
     }
 
+    pub(crate) fn project_service(&self) -> Option<Arc<ProjectService>> {
+        self.project_service.read().ok().and_then(|guard| guard.clone())
+    }
+
     /// Project-bind side branch: resolve the owner's workspace into a
     /// project/folder and backfill `conversations.project_id`/`folder_id`.
     ///

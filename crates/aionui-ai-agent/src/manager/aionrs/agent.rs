@@ -37,6 +37,7 @@ use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
+use crate::capability::generated_artifacts::{PUBLISH_ARTIFACT_TOOL, PublishArtifactTool};
 use crate::capability::user_questions::{AskUserQuestionTool, TOOL_NAME, UserQuestions};
 
 use super::content::build_content_blocks;
@@ -207,6 +208,7 @@ impl AionrsAgentManager {
 
         // Asking the customer always waits on its own answer channel, never on a tool permission.
         config.tools.allow_list.push(TOOL_NAME.into());
+        config.tools.allow_list.push(PUBLISH_ARTIFACT_TOOL.into());
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;
@@ -280,6 +282,9 @@ impl AionrsAgentManager {
         engine
             .registry_mut()
             .register(Box::new(AskUserQuestionTool(user_questions.clone())));
+        engine
+            .registry_mut()
+            .register(Box::new(PublishArtifactTool(PathBuf::from(&workspace))));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));

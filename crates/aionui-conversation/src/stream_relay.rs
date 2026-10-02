@@ -173,6 +173,7 @@ pub struct StreamRelay {
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
+    generated_artifact_projects: Option<Arc<aionui_project::ProjectService>>,
 }
 
 impl StreamRelay {
@@ -206,11 +207,17 @@ impl StreamRelay {
             complete_turn: true,
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
+            generated_artifact_projects: None,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_generated_artifacts(mut self, projects: Option<Arc<aionui_project::ProjectService>>) -> Self {
+        self.generated_artifact_projects = projects;
         self
     }
 
@@ -304,6 +311,7 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
+        let mut generated_calls = crate::generated_artifacts::GeneratedFileCalls::default();
 
         loop {
             let recv_result = if send_error_done {
@@ -581,6 +589,14 @@ impl StreamRelay {
                                 .await;
                             self.forward_to_websocket(&event);
                             self.adapter.persist_tool_call(data).await;
+                            if let Some(projects) = &self.generated_artifact_projects
+                                && let Some(path) = generated_calls.observe(data)
+                            {
+                                let id = format!("generated-{}", ConversationService::mint_msg_id());
+                                if crate::generated_artifacts::publish_generated_file(&self.repo, projects, &self.broadcaster, &self.user_id, &self.conversation_id, id, &path).await.is_err() {
+                                    debug!(conversation_id = %self.conversation_id, "Generated document was not eligible for preview");
+                                }
+                            }
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
                             attempt.saw_tool_or_side_effect = true;
