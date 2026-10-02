@@ -1,6 +1,9 @@
 /// File crate application errors.
 #[derive(Debug, thiserror::Error)]
 pub enum FileError {
+    #[error("attachment exceeds the 25 MiB limit")]
+    UploadTooLarge,
+
     #[error("{0}")]
     BadRequest(String),
 

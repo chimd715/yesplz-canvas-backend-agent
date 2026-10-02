@@ -352,6 +352,15 @@ impl ProjectService {
                 } else {
                     real_root.join(&resolved.relative_path)
                 };
+                if !aionui_common::user_paths::managed_upload_access_allowed(
+                    &std::env::temp_dir().join("aionui"),
+                    user_id,
+                    &abs,
+                ) {
+                    return Err(ProjectError::ProjectExplorerNotFound {
+                        pe_id: input.pe_id.clone(),
+                    });
+                }
                 Some(abs.to_string_lossy().into_owned())
             }
             None => None,

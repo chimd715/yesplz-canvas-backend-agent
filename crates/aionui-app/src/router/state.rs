@@ -544,7 +544,13 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
-    let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
+    let file_service = Arc::new(
+        FileService::new(broadcaster.clone(), allowed_roots.clone()).with_upload_authorizer(Arc::new(
+            super::file_upload_authorizer::ConversationUploadAuthorizer {
+                conversations: services.conversation_repo.clone(),
+            },
+        )),
+    );
     let snapshot_service = Arc::new(SnapshotService::new());
     // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
     // `/api/fs/open-system` (open with the default application): adapters over one

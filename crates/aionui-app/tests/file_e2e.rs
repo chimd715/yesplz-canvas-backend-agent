@@ -914,6 +914,33 @@ fn upload_request(content_type: &str, body: Vec<u8>, token: &str, csrf: &str) ->
         .unwrap()
 }
 
+async fn seed_upload_conversation(services: &aionui_app::AppServices, username: &str, id: &str) {
+    let user = services.user_repo.find_by_username(username).await.unwrap().unwrap();
+    let now = aionui_common::now_ms();
+    services
+        .conversation_repo
+        .create(&aionui_db::models::ConversationRow {
+            id: id.to_owned(),
+            user_id: user.id,
+            name: "Upload fixture".to_owned(),
+            r#type: "aionrs".to_owned(),
+            extra: "{}".to_owned(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: Some("aionui".to_owned()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn upload_accepts_small_png_and_returns_readable_path() {
     let (mut app, services) = build_app().await;
@@ -928,6 +955,7 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
     ];
 
     let conv_id = format!("conv-upload-{}", std::process::id());
+    seed_upload_conversation(&services, "admin", &conv_id).await;
     let (content_type, body) = UploadMultipart::new()
         .add_file("file", "paste.png", "image/png", &png_bytes)
         .add_text("conversation_id", &conv_id)
@@ -1308,4 +1336,294 @@ async fn stream_requires_auth() {
     // GET has no CSRF layer (unlike the POST endpoints, which 403 on missing
     // CSRF); the auth middleware rejects the missing token with 401.
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn upload_rejects_missing_auth_even_with_valid_csrf() {
+    let (mut app, services) = build_app().await;
+    let (_, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "denied.txt", "text/plain", b"bytes")
+        .build();
+    let mut req = upload_request(&content_type, body, "", &csrf);
+    req.headers_mut().remove("authorization");
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn upload_rejects_missing_or_invalid_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    for missing in [true, false] {
+        let (content_type, body) = UploadMultipart::new()
+            .add_file("file", "denied.txt", "text/plain", b"bytes")
+            .build();
+        let mut req = upload_request(&content_type, body, &token, &csrf);
+        if missing {
+            req.headers_mut().remove("x-csrf-token");
+        } else {
+            req.headers_mut().insert("x-csrf-token", "wrong".parse().unwrap());
+        }
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+    }
+}
+
+#[tokio::test]
+async fn upload_rejects_unknown_or_other_users_conversation() {
+    let (mut app, services) = build_app().await;
+    setup_and_login(&mut app, &services, "owner", "StrongP@ss1").await;
+    seed_upload_conversation(&services, "owner", "owner-upload").await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss1").await;
+    for conversation_id in ["unknown-upload", "owner-upload"] {
+        let (content_type, body) = UploadMultipart::new()
+            .add_file("file", "denied.txt", "text/plain", b"bytes")
+            .add_text("conversation_id", conversation_id)
+            .build();
+        let resp = app
+            .clone()
+            .oneshot(upload_request(&content_type, body, &token, &csrf))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await["error"], "conversation not found");
+    }
+}
+
+#[tokio::test]
+async fn upload_rejects_conversation_path_injection() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "safe.txt", "text/plain", b"bytes")
+        .add_text("conversation_id", "../../outside")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn upload_strips_client_directories_without_writing_outside_owner_root() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "upload-owner", "StrongP@ss1").await;
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "../../customer.txt", "text/plain", b"customer bytes")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let path = std::path::Path::new(json["data"].as_str().unwrap());
+    let user = services
+        .user_repo
+        .find_by_username("upload-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    let root = aionui_common::user_paths::user_upload_root(&std::env::temp_dir().join("aionui"), &user.id).unwrap();
+    assert!(path.starts_with(root));
+    assert_eq!(std::fs::read(path).unwrap(), b"customer bytes");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn upload_new_file_can_be_read_only_through_owners_upload_ref() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "file-owner", "StrongP@ss1").await;
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "private.txt", "text/plain", b"owner bytes")
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let path = json["data"].as_str().unwrap().to_owned();
+    let file = json!({ "file": { "kind": "upload", "path": path }, "encoding": "utf8" });
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            file.clone(),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"], "owner bytes");
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "file-other", "StrongP@ss1").await;
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/content",
+            file,
+            &other_token,
+            &other_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let denial = body_json(resp).await;
+    assert_eq!(denial["code"], "FILE_NOT_FOUND");
+    assert!(!denial.to_string().contains(&path));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn upload_ownership_cannot_be_bypassed_by_local_refs_legacy_paths_or_aliases() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "legacy-owner", "StrongP@ss1").await;
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "private.png", "image/png", b"private upload bytes")
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &owner_token, &owner_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let path = json["data"].as_str().unwrap().to_owned();
+    let workspace = std::path::Path::new(&path)
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/fs/read",
+            json!({ "path": path, "workspace": workspace }),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"], "private upload bytes");
+
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "legacy-other", "StrongP@ss1").await;
+    let other_id = services
+        .user_repo
+        .find_by_username("legacy-other")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let target = tempfile::tempdir().unwrap();
+    let project = services
+        .project_service
+        .create_standard(
+            &other_id,
+            aionui_project::canonical::to_file_uri(target.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let alias_dir = tempfile::tempdir().unwrap();
+    let alias = alias_dir.path().join("alias.png");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    for candidate in [&path, &alias.to_string_lossy().into_owned()] {
+        for (uri, body) in [
+            ("/api/fs/read", json!({ "path": candidate, "workspace": workspace })),
+            ("/api/fs/metadata", json!({ "path": candidate, "workspace": workspace })),
+            (
+                "/api/fs/image-base64",
+                json!({ "path": candidate, "workspace": workspace }),
+            ),
+            (
+                "/api/fs/write",
+                json!({ "path": candidate, "workspace": workspace, "data": "modified" }),
+            ),
+            (
+                "/api/fs/copy",
+                json!({ "file_paths": [candidate], "target": { "pe_id": project.project_explorer.pe_id, "relative_path": "" } }),
+            ),
+            (
+                "/api/fs/content",
+                json!({ "file": { "kind": "local", "path": candidate }, "encoding": "utf8" }),
+            ),
+            (
+                "/api/fs/content/metadata",
+                json!({ "file": { "kind": "local", "path": candidate } }),
+            ),
+            (
+                "/api/word-preview/start",
+                json!({ "file_path": candidate, "workspace": workspace }),
+            ),
+            (
+                "/api/word-preview/refresh",
+                json!({ "file_path": candidate, "workspace": workspace }),
+            ),
+            (
+                "/api/document/convert",
+                json!({ "file_path": candidate, "workspace": workspace, "to": "markdown" }),
+            ),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(json_with_token("POST", uri, body, &other_token, &other_csrf))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "must deny {uri}");
+            let denial = body_json(resp).await.to_string();
+            assert!(!denial.contains(&path), "must not disclose a managed path on {uri}");
+            assert!(!denial.contains("private upload bytes"));
+        }
+        let uri = format!("/api/fs/stream?kind=local&path={candidate}");
+        let resp = app
+            .clone()
+            .oneshot(get_with_token(&uri, &other_token, &other_csrf, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    for uri in ["/api/fs/dir", "/api/fs/list", "/api/fs/snapshot/init"] {
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                uri,
+                json!({ "dir": workspace, "root": workspace, "workspace": workspace }),
+                &other_token,
+                &other_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "must deny {uri}");
+    }
+    for uri in ["/api/fs/dir", "/api/fs/list", "/api/fs/snapshot/init"] {
+        let ancestor = std::env::temp_dir().to_string_lossy().into_owned();
+        let resp = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                uri,
+                json!({ "dir": ancestor, "root": ancestor, "workspace": ancestor }),
+                &other_token,
+                &other_csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "must deny managed ancestor on {uri}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"private upload bytes");
+    assert!(std::fs::read_dir(target.path()).unwrap().next().is_none());
+    std::fs::remove_file(path).unwrap();
 }

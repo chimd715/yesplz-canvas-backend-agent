@@ -68,9 +68,9 @@ impl ProjectService {
     /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
-    /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
-    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
-    ///   produced it already exposes the whole filesystem).
+    /// - `Upload` → an existing regular file under the caller-owned managed upload namespace.
+    /// - `Local` → a canonicalized existing regular file. Managed uploads keep
+    ///   their ownership guard; other host paths retain the native picker policy.
     ///
     /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
     /// identical regardless of op.
@@ -96,6 +96,9 @@ impl ProjectService {
                 let abs = resolved.absolute_path.ok_or_else(|| ProjectError::ChatFileMissing {
                     path: relative_path.clone(),
                 })?;
+                if !aionui_common::user_paths::managed_upload_access_allowed(upload_root, user_id, Path::new(&abs)) {
+                    return Err(ProjectError::UploadPathOutsideRoot { path: abs });
+                }
                 // A project ref may point at a file or a folder (the tree
                 // allows attaching a directory); require only that it exists.
                 if !Path::new(&abs).exists() {
@@ -108,17 +111,19 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                if !path_within(upload_root, candidate) {
+                if !path_within(upload_root, candidate)
+                    || !aionui_common::user_paths::managed_upload_access_allowed(upload_root, user_id, candidate)
+                {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
                 Ok(path.clone())
             }
             ChatFileRef::Local { path } => {
-                // A path the user explicitly picked in the host-file browser,
-                // which already exposes the whole filesystem. No managed-root
-                // restriction (that is the upload channel's D2 invariant only);
-                // just canonicalize (collapsing `..`/symlinks) and require an
-                // existing regular file.
+                // Native host paths retain the existing sandbox policy, but a
+                // managed attachment keeps its owner regardless of ref kind.
+                if !aionui_common::user_paths::managed_upload_access_allowed(upload_root, user_id, Path::new(path)) {
+                    return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
+                }
                 let canonical = std::fs::canonicalize(path)
                     .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
                 if !canonical.is_file() {

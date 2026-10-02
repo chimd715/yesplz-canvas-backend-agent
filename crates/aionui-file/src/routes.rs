@@ -36,6 +36,12 @@ use crate::types::{
 impl From<FileError> for ApiError {
     fn from(error: FileError) -> Self {
         match error {
+            FileError::UploadTooLarge => ApiError::coded(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "FILE_TOO_LARGE",
+                "Each attachment must be 25 MiB or smaller.",
+                None::<serde_json::Value>,
+            ),
             FileError::BadRequest(message) => ApiError::BadRequest(message),
             FileError::Forbidden(message) => ApiError::Forbidden(message),
             FileError::PathOutsideSandbox {
@@ -165,9 +171,16 @@ pub fn file_routes(state: FileRouterState) -> Router {
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.dir))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.root))?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -175,9 +188,13 @@ async fn get_files_by_dir(
 
 async fn list_workspace_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.root))?;
     let root = req.root.trim();
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
@@ -193,9 +210,13 @@ async fn list_workspace_files(
 
 async fn get_file_metadata(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.path))?;
     let meta = state
         .file_service
         .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
@@ -205,9 +226,13 @@ async fn get_file_metadata(
 
 async fn read_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.path))?;
     let content = state
         .file_service
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
@@ -259,7 +284,7 @@ async fn copy_files(
         .ok_or_else(|| ApiError::BadRequest("copy target is not a local path".to_owned()))?;
     let result = state
         .file_service
-        .copy_files_to_workspace(&req.file_paths, &dir, req.source_root.as_deref())
+        .copy_files_to_workspace_for_user(&user.id, &req.file_paths, &dir, req.source_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
 }
@@ -654,6 +679,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -664,16 +690,25 @@ async fn upload_file(
 
     let path = state
         .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+        .create_upload_file(
+            &user.id,
+            &file_name,
+            &fields.file_data,
+            fields.conversation_id.as_deref(),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(path)))
 }
 
 async fn get_image_base64(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.path))?;
     let data_url = state
         .file_service
         .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
@@ -696,36 +731,55 @@ async fn fetch_remote_image(
 
 async fn snapshot_init(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_info(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_compare(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
 
 async fn snapshot_baseline(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, &Path::new(&req.workspace).join(&req.file_path))?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -735,9 +789,16 @@ async fn snapshot_baseline(
 
 async fn snapshot_stage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, &Path::new(&req.workspace).join(&req.file_path))?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -747,18 +808,29 @@ async fn snapshot_stage_file(
 
 async fn snapshot_stage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_unstage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, &Path::new(&req.workspace).join(&req.file_path))?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -768,18 +840,29 @@ async fn snapshot_unstage_file(
 
 async fn snapshot_unstage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_discard(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, &Path::new(&req.workspace).join(&req.file_path))?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -789,9 +872,16 @@ async fn snapshot_discard(
 
 async fn snapshot_reset(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, &Path::new(&req.workspace).join(&req.file_path))?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -801,18 +891,26 @@ async fn snapshot_reset(
 
 async fn snapshot_branches(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
 
 async fn snapshot_dispose(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .file_service
+        .authorize_managed_upload_path(&user.id, Path::new(&req.workspace))?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }

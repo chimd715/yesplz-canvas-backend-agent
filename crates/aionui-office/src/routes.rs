@@ -173,7 +173,7 @@ async fn start_preview(
                 .await
                 .map_err(ApiError::from)?
         }
-        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+        None => validate_office_path(&state, user_id, &req.file_path, req.workspace.as_deref())?
             .to_string_lossy()
             .into_owned(),
     };
@@ -240,7 +240,7 @@ async fn refresh_preview(
                 .await
                 .map_err(refresh_resolve_error)?
         }
-        None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+        None => validate_office_path(&state, user_id, &req.file_path, req.workspace.as_deref())?
             .to_string_lossy()
             .into_owned(),
     };
@@ -330,11 +330,11 @@ async fn stop_preview(
 
 async fn convert_document(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
+    let validated_path = validate_office_path(&state, &user.id, &req.file_path, req.workspace.as_deref())?;
     let resp = state
         .conversion_service
         .convert(validated_path.to_string_lossy().as_ref(), req.to)
@@ -344,9 +344,17 @@ async fn convert_document(
 
 fn validate_office_path(
     state: &OfficeRouterState,
+    user_id: &str,
     file_path: &str,
     workspace: Option<&str>,
 ) -> Result<PathBuf, ApiError> {
+    if !aionui_common::user_paths::managed_upload_access_allowed(
+        &std::env::temp_dir().join("aionui"),
+        user_id,
+        FsPath::new(file_path),
+    ) {
+        return Err(file_error_to_api_error(FileError::TargetNotFound));
+    }
     let allowed_roots: Vec<&FsPath> = state.allowed_roots.iter().map(PathBuf::as_path).collect();
     validate_path_with_extra_root(file_path, &allowed_roots, workspace.map(FsPath::new))
         .map_err(file_error_to_api_error)
@@ -354,6 +362,7 @@ fn validate_office_path(
 
 fn file_error_to_api_error(error: FileError) -> ApiError {
     match error {
+        FileError::UploadTooLarge => FileError::UploadTooLarge.into(),
         FileError::BadRequest(message) => ApiError::BadRequest(message),
         FileError::Forbidden(message) => ApiError::Forbidden(message),
         FileError::PathOutsideSandbox {

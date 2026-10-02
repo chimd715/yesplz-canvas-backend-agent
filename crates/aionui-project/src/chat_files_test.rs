@@ -636,3 +636,104 @@ async fn upgraded_ref_carries_exactly_the_fs_channel_target_fields() {
     assert_eq!(target.pe_id, pe_id);
     assert_eq!(target.relative_path, "watched.md");
 }
+
+#[tokio::test]
+async fn owned_upload_rejects_other_user_even_with_known_path() {
+    let (service, _, _, upload_root) = setup().await;
+    let owned = aionui_common::user_paths::user_upload_root(upload_root.path(), "user_owner").unwrap();
+    std::fs::create_dir_all(&owned).unwrap();
+    let path = owned.join("private.txt");
+    std::fs::write(&path, b"private bytes").unwrap();
+    let file = ChatFileRef::Upload {
+        path: path.to_string_lossy().into_owned(),
+    };
+    let own = service
+        .resolve_chat_file_ref("user_owner", &file, upload_root.path(), crate::FileOp::Read)
+        .await
+        .unwrap();
+    assert_eq!(own, path.to_string_lossy());
+    for user in ["user_other", "system_default_user"] {
+        let err = service
+            .resolve_chat_file_ref(user, &file, upload_root.path(), crate::FileOp::Read)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }));
+    }
+}
+
+#[tokio::test]
+async fn remote_user_cannot_claim_legacy_uploads_without_owner_identity() {
+    let (service, _, _, upload_root) = setup().await;
+    let path = upload_root.path().join("legacy.txt");
+    std::fs::write(&path, b"legacy bytes").unwrap();
+    let file = ChatFileRef::Upload {
+        path: path.to_string_lossy().into_owned(),
+    };
+    let err = service
+        .resolve_chat_file_ref("user_remote", &file, upload_root.path(), crate::FileOp::Read)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_owner_directory_symlink_cannot_impersonate_another_owner() {
+    let (service, _, _, upload_root) = setup().await;
+    let owner = aionui_common::user_paths::user_upload_root(upload_root.path(), "user_owner").unwrap();
+    let other = aionui_common::user_paths::user_upload_root(upload_root.path(), "user_other").unwrap();
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(owner.join("private.txt"), b"private").unwrap();
+    std::os::unix::fs::symlink(&owner, &other).unwrap();
+    let file = ChatFileRef::Upload {
+        path: other.join("private.txt").to_string_lossy().into_owned(),
+    };
+    let error = service
+        .resolve_chat_file_ref("user_other", &file, upload_root.path(), crate::FileOp::Read)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProjectError::UploadPathOutsideRoot { .. }));
+}
+
+#[tokio::test]
+async fn local_and_project_refs_cannot_bypass_managed_upload_ownership() {
+    let (service, _pe_id, _dir, upload_root) = setup().await;
+    let owned = aionui_common::user_paths::user_upload_root(upload_root.path(), "user_alice").unwrap();
+    std::fs::create_dir_all(&owned).unwrap();
+    let path = owned.join("private.txt");
+    std::fs::write(&path, b"private").unwrap();
+    let local = ChatFileRef::Local {
+        path: path.to_string_lossy().into_owned(),
+    };
+    assert!(
+        service
+            .resolve_chat_file_ref("user_alice", &local, upload_root.path(), crate::FileOp::Read)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        service
+            .resolve_chat_file_ref("user_bob", &local, upload_root.path(), crate::FileOp::Read)
+            .await,
+        Err(ProjectError::UploadPathOutsideRoot { .. })
+    ));
+    let project = service
+        .create_standard("system_default_user", to_file_uri(&owned).unwrap())
+        .await
+        .unwrap();
+    let project_ref = ChatFileRef::Project {
+        pe_id: project.project_explorer.pe_id,
+        relative_path: "private.txt".into(),
+    };
+    assert!(matches!(
+        service
+            .resolve_chat_file_ref(
+                "system_default_user",
+                &project_ref,
+                upload_root.path(),
+                crate::FileOp::Read
+            )
+            .await,
+        Err(ProjectError::UploadPathOutsideRoot { .. })
+    ));
+}

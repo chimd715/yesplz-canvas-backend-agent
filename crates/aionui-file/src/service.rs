@@ -22,6 +22,9 @@ use crate::types::{
 /// Maximum number of files returned by `list_workspace_files`.
 const MAX_WORKSPACE_FILES: usize = 20_000;
 
+/// File payload cap below the 30 MiB multipart request limit.
+const MAX_UPLOAD_FILE_SIZE: usize = 25 * 1024 * 1024;
+
 /// Maximum file size for read operations (256 MB).
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -64,6 +67,7 @@ pub struct FileService {
     allowed_roots: Vec<std::path::PathBuf>,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
     workspace_files_cache: DashMap<String, Vec<WorkspaceFlatFile>>,
+    upload_authorizer: Option<Arc<dyn crate::traits::IUploadAuthorizer>>,
 }
 
 impl FileService {
@@ -72,7 +76,14 @@ impl FileService {
             broadcaster,
             allowed_roots,
             workspace_files_cache: DashMap::new(),
+            upload_authorizer: None,
         }
+    }
+
+    /// Install the composition-owned authorization port for bound uploads.
+    pub fn with_upload_authorizer(mut self, authorizer: Arc<dyn crate::traits::IUploadAuthorizer>) -> Self {
+        self.upload_authorizer = Some(authorizer);
+        self
     }
 
     /// Invalidate the workspace files cache for a given root.
@@ -392,7 +403,17 @@ fn copy_single_file_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
 /// Recursively copy a directory tree from `src` to `dest`. `dest` must not yet
 /// exist (the caller picks a conflict-free name); the whole subtree is recreated
 /// underneath it, so no inner-file collision handling is needed.
-fn copy_dir_recursive_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
+fn authorize_managed_upload_path(user_id: &str, path: &Path) -> Result<(), FileError> {
+    if aionui_common::user_paths::managed_upload_access_allowed(&std::env::temp_dir().join("aionui"), user_id, path) {
+        Ok(())
+    } else {
+        Err(FileError::TargetNotFound)
+    }
+}
+
+fn copy_dir_recursive_sync(src: &Path, dest: &Path, user_id: &str) -> Result<(), FileError> {
+    authorize_managed_upload_path(user_id, src)?;
+    authorize_managed_upload_path(user_id, dest)?;
     std::fs::create_dir_all(dest)
         .map_err(|e| FileError::Internal(format!("cannot create directory '{}': {e}", dest.display())))?;
 
@@ -402,15 +423,16 @@ fn copy_dir_recursive_sync(src: &Path, dest: &Path) -> Result<(), FileError> {
         let entry = entry.map_err(|e| FileError::Internal(format!("cannot read directory entry: {e}")))?;
         let child_src = entry.path();
         let child_dest = dest.join(entry.file_name());
-        // `file_type()` does not follow symlinks; a symlinked subdir is copied as
-        // a plain file via `std::fs::copy` rather than being followed (avoids
-        // cycles and escaping the source tree).
+        // Do not recurse through symlink directories. `std::fs::copy` follows
+        // file symlinks, so authorize each resolved child before copying it.
         let file_type = entry
             .file_type()
             .map_err(|e| FileError::Internal(format!("cannot stat '{}': {e}", child_src.display())))?;
         if file_type.is_dir() {
-            copy_dir_recursive_sync(&child_src, &child_dest)?;
+            copy_dir_recursive_sync(&child_src, &child_dest, user_id)?;
         } else {
+            authorize_managed_upload_path(user_id, &child_src)?;
+            authorize_managed_upload_path(user_id, &child_dest)?;
             std::fs::copy(&child_src, &child_dest).map_err(|e| {
                 FileError::Internal(format!(
                     "cannot copy '{}' to '{}': {e}",
@@ -568,6 +590,10 @@ fn validate_remote_image_url(raw_url: &str) -> Result<reqwest::Url, String> {
 
 #[async_trait::async_trait]
 impl crate::traits::IFileService for FileService {
+    fn authorize_managed_upload_path(&self, user_id: &str, path: &Path) -> Result<(), FileError> {
+        authorize_managed_upload_path(user_id, path)
+    }
+
     // -- Content endpoint (pre-resolved absolute paths) --
     //
     // These operate on a path already resolved + containment-checked upstream by
@@ -719,6 +745,7 @@ impl crate::traits::IFileService for FileService {
         data: &[u8],
         workspace: &str,
     ) -> Result<bool, FileError> {
+        authorize_managed_upload_path(user_id, Path::new(path))?;
         if has_traversal(path) {
             return Err(FileError::BadRequest(format!(
                 "path '{}' contains invalid traversal patterns",
@@ -772,6 +799,24 @@ impl crate::traits::IFileService for FileService {
         workspace: &str,
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError> {
+        self.copy_files_to_workspace_for_user("system_default_user", file_paths, workspace, source_root)
+            .await
+    }
+
+    async fn copy_files_to_workspace_for_user(
+        &self,
+        user_id: &str,
+        file_paths: &[String],
+        workspace: &str,
+        source_root: Option<&str>,
+    ) -> Result<CopyResult, FileError> {
+        authorize_managed_upload_path(user_id, Path::new(workspace))?;
+        for path in file_paths {
+            authorize_managed_upload_path(user_id, Path::new(path))?;
+        }
+        if let Some(root) = source_root {
+            authorize_managed_upload_path(user_id, Path::new(root))?;
+        }
         let roots = self.allowed_roots_refs();
         let ws_canonical = validate_path_with_extra_root(workspace, &roots, Some(Path::new(workspace)))?;
 
@@ -782,6 +827,7 @@ impl crate::traits::IFileService for FileService {
 
         let file_paths_owned: Vec<String> = file_paths.to_vec();
         let roots_owned: Vec<std::path::PathBuf> = self.allowed_roots.clone();
+        let copy_user_id = user_id.to_owned();
         let workspace_root_owned = ws_canonical.clone();
         let source_root_owned = sr_canonical.clone();
 
@@ -851,8 +897,12 @@ impl crate::traits::IFileService for FileService {
                     }
                 };
 
+                if authorize_managed_upload_path(&copy_user_id, &dest).is_err() {
+                    fail(fp, "copy target is not accessible");
+                    continue;
+                }
                 let outcome = if is_dir {
-                    copy_dir_recursive_sync(&src, &dest)
+                    copy_dir_recursive_sync(&src, &dest, &copy_user_id)
                 } else {
                     copy_single_file_sync(&src, &dest)
                 };
@@ -873,12 +923,20 @@ impl crate::traits::IFileService for FileService {
 
     async fn create_upload_file(
         &self,
+        user_id: &str,
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
     ) -> Result<String, FileError> {
-        if file_name.is_empty() {
-            return Err(FileError::BadRequest("file name must not be empty".to_owned()));
+        if data.len() > MAX_UPLOAD_FILE_SIZE {
+            return Err(FileError::UploadTooLarge);
+        }
+        if file_name.is_empty()
+            || matches!(file_name, "." | "..")
+            || file_name.len() > 240
+            || file_name.chars().any(char::is_control)
+        {
+            return Err(FileError::BadRequest("invalid attachment file name".to_owned()));
         }
         if has_traversal(file_name) {
             return Err(FileError::BadRequest(format!(
@@ -896,7 +954,7 @@ impl crate::traits::IFileService for FileService {
         // Validate optional conversation_id: no separators / traversal.
         let conv_id = match conversation_id {
             Some(id) if !id.is_empty() => {
-                if has_traversal(id) || id.contains('/') || id.contains('\\') {
+                if id.len() > 100 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
                     return Err(FileError::BadRequest(format!(
                         "conversation id '{}' contains invalid characters",
                         id
@@ -907,33 +965,71 @@ impl crate::traits::IFileService for FileService {
             _ => None,
         };
 
+        if let Some(conversation_id) = conv_id.as_deref() {
+            let authorizer = self
+                .upload_authorizer
+                .as_ref()
+                .ok_or_else(|| FileError::Internal("upload authorization is unavailable".to_owned()))?;
+            authorizer.authorize(user_id, conversation_id).await?;
+        }
+        let upload_root = aionui_common::user_paths::user_upload_root(&std::env::temp_dir().join("aionui"), user_id)
+            .map_err(|_| FileError::BadRequest("invalid upload identity".to_owned()))?;
+
         let name = file_name.to_owned();
         let bytes = data.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
+            let mut dir = upload_root;
             if let Some(conv_id) = conv_id.as_deref() {
                 dir = dir.join(conv_id);
             } else {
                 dir = dir.join("general");
             }
+            let temp_dir = std::env::temp_dir();
+            let mut ancestor = dir.as_path();
+            while ancestor != temp_dir {
+                if std::fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                    return Err(FileError::Forbidden("invalid attachment directory".to_owned()));
+                }
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| FileError::Forbidden("invalid attachment directory".to_owned()))?;
+            }
             std::fs::create_dir_all(&dir)
-                .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
+                .map_err(|_| FileError::Internal("cannot create attachment directory".to_owned()))?;
+            // Do not follow a replaced owner/conversation directory into another
+            // namespace. The canonical temp root may itself be an OS alias.
+            let temp_root = std::fs::canonicalize(std::env::temp_dir())
+                .map_err(|_| FileError::Internal("cannot resolve attachment directory".to_owned()))?;
+            let expected = dir
+                .strip_prefix(std::env::temp_dir())
+                .map(|relative| temp_root.join(relative))
+                .map_err(|_| FileError::Forbidden("invalid attachment directory".to_owned()))?;
+            let canonical_dir = std::fs::canonicalize(&dir)
+                .map_err(|_| FileError::Internal("cannot resolve attachment directory".to_owned()))?;
+            if canonical_dir != expected {
+                return Err(FileError::Forbidden("invalid attachment directory".to_owned()));
+            }
 
             let (base, ext) = split_base_ext(&name);
             let mut candidate = name.clone();
             let mut counter: u32 = 2;
             loop {
                 let file_path = dir.join(&candidate);
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&file_path)
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
                 {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&file_path) {
                     Ok(mut f) => {
-                        f.write_all(&bytes).map_err(|e| {
-                            FileError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
-                        })?;
+                        if f.write_all(&bytes).is_err() {
+                            drop(f);
+                            let _ = std::fs::remove_file(&file_path);
+                            return Err(FileError::Internal("cannot write attachment".to_owned()));
+                        }
                         return Ok(file_path.to_string_lossy().into_owned());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1566,7 +1662,7 @@ mod tests {
         fs::write(src.join("nested/deep/leaf.txt"), "leaf").unwrap();
 
         let dest = root.path().join("dest");
-        copy_dir_recursive_sync(&src, &dest).unwrap();
+        copy_dir_recursive_sync(&src, &dest, "system_default_user").unwrap();
 
         assert_eq!(fs::read_to_string(dest.join("top.txt")).unwrap(), "top");
         assert_eq!(fs::read_to_string(dest.join("nested/mid.txt")).unwrap(), "mid");

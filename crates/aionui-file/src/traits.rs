@@ -16,6 +16,9 @@ use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotI
 /// `path_safety` module) before reaching this trait's implementations.
 #[async_trait::async_trait]
 pub trait IFileService: Send + Sync {
+    /// Check the caller's ownership when a legacy path names a managed upload.
+    fn authorize_managed_upload_path(&self, user_id: &str, path: &Path) -> Result<(), FileError>;
+
     // -- Content endpoint (pre-resolved absolute paths) --
     //
     // The caller (preview content endpoint) has already resolved a `ChatFileRef`
@@ -93,15 +96,28 @@ pub trait IFileService: Send + Sync {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
 
+    /// Authenticated copy, including managed-upload ownership for sources and
+    /// destinations. Other host paths retain their existing sandbox policy.
+    async fn copy_files_to_workspace_for_user(
+        &self,
+        user_id: &str,
+        file_paths: &[String],
+        workspace: &str,
+        source_root: Option<&str>,
+    ) -> Result<CopyResult, FileError> {
+        let _ = user_id;
+        self.copy_files_to_workspace(file_paths, workspace, source_root).await
+    }
+
     /// Write `data` to a temporary file and return its absolute path.
     ///
-    /// When `conversation_id` is provided, the file is placed under a
-    /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used.
+    /// Files are stored under the authenticated user's namespace. A supplied
+    /// conversation must belong to that user before any file is written.
     ///
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(
         &self,
+        user_id: &str,
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
@@ -234,3 +250,10 @@ pub trait IClipboardWriter: Send + Sync {
 
 /// Convenience alias for an Arc-wrapped clipboard writer.
 pub type ClipboardWriterRef = Arc<dyn IClipboardWriter>;
+
+/// Ownership port for conversation-bound uploads. Composition supplies the
+/// adapter; the file capability does not depend on the conversation domain.
+#[async_trait::async_trait]
+pub trait IUploadAuthorizer: Send + Sync {
+    async fn authorize(&self, user_id: &str, conversation_id: &str) -> Result<(), FileError>;
+}

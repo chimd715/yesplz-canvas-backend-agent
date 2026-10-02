@@ -189,3 +189,75 @@ async fn copy_files_rejects_source_outside_explicit_source_root() {
     assert_eq!(result.failed_files.len(), 1);
     assert!(!workspace.path().join("secret.txt").exists());
 }
+
+#[tokio::test]
+async fn upload_rejects_oversized_bytes_before_creating_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = make_service(dir.path());
+    let error = service
+        .create_upload_file("user_upload", "large.bin", &vec![0; 25 * 1024 * 1024 + 1], None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, aionui_file::FileError::UploadTooLarge));
+}
+
+#[tokio::test]
+async fn upload_rejects_control_characters_in_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = make_service(dir.path());
+    for filename in ["line\nfile.txt", "null\0file.txt", ".", ".."] {
+        let error = service
+            .create_upload_file("user_upload", filename, b"bytes", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, aionui_file::FileError::BadRequest(_)));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_rejects_symlinked_owner_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = format!("user_symlink-{}", aionui_common::generate_short_id());
+    let root = aionui_common::user_paths::user_upload_root(&std::env::temp_dir().join("aionui"), &user).unwrap();
+    std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(dir.path(), &root).unwrap();
+    let service = make_service(dir.path());
+    let error = service
+        .create_upload_file(&user, "escape.txt", b"bytes", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, aionui_file::FileError::Forbidden(_)));
+    assert!(!dir.path().join("general").exists());
+    std::fs::remove_file(root).unwrap();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn copy_directory_cannot_follow_a_symlink_to_another_users_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+    let owner = aionui_common::generate_prefixed_id("user");
+    let path = svc
+        .create_upload_file(&owner, "private.txt", b"private upload bytes", None)
+        .await
+        .unwrap();
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&path, source.join("alias.txt")).unwrap();
+    let result = svc
+        .copy_files_to_workspace_for_user(
+            "user_other",
+            &[source.to_string_lossy().into_owned()],
+            target.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.copied_files.is_empty());
+    assert_eq!(result.failed_files.len(), 1);
+    assert!(!target.join("source/alias.txt").exists());
+    fs::remove_file(path).unwrap();
+}
