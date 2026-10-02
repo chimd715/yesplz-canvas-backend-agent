@@ -59,6 +59,9 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
 
+#[path = "service_test/managed_customer_test.rs"]
+mod managed_customer_test;
+
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
@@ -229,6 +232,7 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
 // ── Mock Repository ────────────────────────────────────────────────
 
 struct MockRepo {
+    fail_next_update: AtomicBool,
     rows: Mutex<Vec<ConversationRow>>,
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
@@ -238,6 +242,7 @@ struct MockRepo {
 impl MockRepo {
     fn new() -> Self {
         Self {
+            fail_next_update: AtomicBool::new(false),
             rows: Mutex::new(vec![]),
             messages: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
@@ -286,6 +291,9 @@ impl IConversationRepository for MockRepo {
     }
 
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+        if self.fail_next_update.swap(false, Ordering::SeqCst) {
+            return Err(DbError::Init("injected update failure".into()));
+        }
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .iter_mut()

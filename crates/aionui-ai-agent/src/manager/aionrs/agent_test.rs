@@ -37,12 +37,55 @@ fn make_test_config() -> AionrsResolvedConfig {
         compat_overrides: Default::default(),
         session_directory: env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
+        managed_customer_mode: false,
         skills: Vec::new(),
         extra_mcp_servers: HashMap::new(),
         bedrock_config: None,
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
     }
+}
+
+#[tokio::test]
+async fn managed_native_agent_enforces_yolo_even_with_legacy_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.managed_customer_mode = true;
+    config.session_mode = Some("default".into());
+    config.session_directory = directory.path().join("sessions");
+    let agent = AionrsAgentManager::new(
+        "managed-policy".into(),
+        directory.path().to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(agent.mode().await.unwrap().mode, "yolo");
+    assert!(agent.check_approval("shell", None));
+    assert!(agent.set_mode("default").await.is_err());
+    assert!(agent.set_config_option("mode", "auto_edit").await.is_err());
+    assert_eq!(agent.mode().await.unwrap().mode, "yolo");
+    agent.set_mode("yolo").await.unwrap();
+    assert!(agent.get_confirmations().is_empty());
+}
+
+#[tokio::test]
+async fn ordinary_native_agent_preserves_configurable_permissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.session_directory = directory.path().join("sessions");
+    let agent = AionrsAgentManager::new(
+        "desktop-policy".into(),
+        directory.path().to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(agent.mode().await.unwrap().mode, "default");
+    agent.set_config_option("mode", "auto_edit").await.unwrap();
+    assert_eq!(agent.mode().await.unwrap().mode, "auto_edit");
 }
 
 #[tokio::test]

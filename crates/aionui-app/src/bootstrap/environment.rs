@@ -82,6 +82,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         work_dir,
         app_version: cli.app_version.clone(),
         local: cli.local || identity_mode.is_local(),
+        managed_customer_mode: managed_customer_mode(std::env::var("AIONUI_MANAGED_CUSTOMER_MODE").ok().as_deref())?,
         identity_mode,
         bootstrap_secret,
         dump_prompts: cli.dump_prompts,
@@ -102,6 +103,18 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         _log_guard: log_guard,
         config,
     })
+}
+
+fn managed_customer_mode(value: Option<&str>) -> Result<bool, BootstrapError> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.managed_customer_mode",
+            "AIONUI_MANAGED_CUSTOMER_MODE must be 0 or 1",
+        )),
+    }
 }
 
 fn validate_identity_environment(
@@ -190,6 +203,14 @@ fn database_init_bootstrap_error(error: aionui_db::DatabaseInitError, db_path: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_policy_is_trusted_startup_configuration() {
+        assert!(!managed_customer_mode(None).unwrap());
+        assert!(!managed_customer_mode(Some("0")).unwrap());
+        assert!(managed_customer_mode(Some("1")).unwrap());
+        assert!(managed_customer_mode(Some("true")).is_err());
+    }
 
     #[test]
     fn database_stage_comes_from_db_boundary_error() {

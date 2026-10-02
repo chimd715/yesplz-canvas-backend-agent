@@ -1295,3 +1295,117 @@ async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
         assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
     }
 }
+
+#[tokio::test]
+async fn managed_native_policy_preserves_http_auth_csrf_ownership_and_model_busy_contract() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = aionui_app::AppConfig {
+        data_dir: directory.path().into(),
+        work_dir: directory.path().into(),
+        managed_customer_mode: true,
+        ..Default::default()
+    };
+    let database = aionui_db::init_database_memory().await.unwrap();
+    let services = aionui_app::AppServices::from_config(database, &config).await.unwrap();
+    let mut app = aionui_app::create_router(&services).await.unwrap();
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other_customer", "StrongP@ss2").await;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({
+                "type": "aionrs", "name": "Customer conversation",
+                "model": { "provider_id": "local-development-mock", "model": "mock-local", "use_model": "mock-local" },
+                "extra": { "session_mode": "default" }
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = body_json(response).await;
+    assert_eq!(created["data"]["extra"]["session_mode"], "yolo");
+    let id = created["data"]["id"].as_str().unwrap();
+    let permission_url = format!("/api/conversations/{id}/config-options/mode");
+    let permission = json!({ "value": "default" });
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PUT")
+                .uri(&permission_url)
+                .header("content-type", "application/json")
+                .header("x-csrf-token", &csrf)
+                .header("cookie", format!("aionui-csrf-token={csrf}"))
+                .body(axum::body::Body::from(permission.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response = app
+        .clone()
+        .oneshot(json_with_token("PUT", &permission_url, permission.clone(), &token, ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            &permission_url,
+            permission.clone(),
+            &other_token,
+            &other_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app
+        .clone()
+        .oneshot(json_with_token("PUT", &permission_url, permission, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "BAD_REQUEST");
+
+    let change = json!({ "model": { "provider_id": "configured-provider", "model": "z-ai/glm-5.3", "use_model": "z-ai/glm-5.3" } });
+    let state = services.conversation_runtime_state.clone();
+    let turn = state.try_claim_turn(id, "active-customer-turn").unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{id}"),
+            change.clone(),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["code"], "CONFLICT");
+    assert_eq!(state.active_turn_id_for(id).as_deref(), Some("active-customer-turn"));
+    drop(turn);
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{id}"),
+            change,
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = body_json(response).await;
+    assert_eq!(updated["data"]["id"], created["data"]["id"]);
+    assert_eq!(updated["data"]["extra"], created["data"]["extra"]);
+    assert_eq!(updated["data"]["model"]["use_model"], "z-ai/glm-5.3");
+    services.database.close().await;
+}

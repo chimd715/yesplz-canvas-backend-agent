@@ -69,6 +69,15 @@ fn make_factory(
     agent_registry: Arc<AgentRegistry>,
     acp_agent_service: Arc<AcpSessionSyncService>,
 ) -> aionui_ai_agent::task_manager::AgentFactory {
+    make_factory_with_policy(provider_repo, agent_registry, acp_agent_service, false)
+}
+
+fn make_factory_with_policy(
+    provider_repo: Arc<dyn IProviderRepository>,
+    agent_registry: Arc<AgentRegistry>,
+    acp_agent_service: Arc<AcpSessionSyncService>,
+    managed_customer_mode: bool,
+) -> aionui_ai_agent::task_manager::AgentFactory {
     let tmp = tempfile::TempDir::new().unwrap();
     let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path()));
     // These provider integration tests only build aionrs tasks, which never touch
@@ -88,6 +97,7 @@ fn make_factory(
         acp_agent_service,
         data_dir: PathBuf::from("/tmp/aionrs-test"),
         dump_prompts: false,
+        managed_customer_mode,
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
@@ -198,4 +208,29 @@ async fn aionrs_factory_respects_use_model_override() {
 
     let result = factory(options).await;
     assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_factory_overrides_customer_mode_and_rejects_runtime_mode_mutation() {
+    let (provider_repo, agent_registry, acp_agent_service) = setup().await;
+    insert_test_provider(provider_repo.as_ref(), "managed-provider", "custom").await;
+    let factory = make_factory_with_policy(provider_repo, agent_registry, acp_agent_service, true);
+    let workspace = tempfile::tempdir().unwrap();
+    let options = make_aionrs_options(
+        "managed-factory-policy",
+        &workspace.path().to_string_lossy(),
+        ProviderWithModel {
+            provider_id: "managed-provider".into(),
+            model: "gpt-4o".into(),
+            use_model: Some("gpt-4o".into()),
+        },
+        AionrsBuildExtra {
+            session_mode: Some("default".into()),
+            ..Default::default()
+        },
+    );
+    let agent = factory(options).await.unwrap();
+    assert_eq!(agent.get_mode().await.unwrap().mode, "yolo");
+    assert!(agent.set_config_option("mode", "default").await.is_err());
+    assert_eq!(agent.get_mode().await.unwrap().mode, "yolo");
 }

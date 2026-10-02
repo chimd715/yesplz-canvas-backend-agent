@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub app_version: String,
     /// Run in local embedded mode (skip authentication, use system_default_user).
     pub local: bool,
+    /// Trusted startup policy for customer-facing native chat; never supplied by a renderer.
+    pub managed_customer_mode: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<String>,
     /// Dump prompt diagnostics under `data_dir/prompt-dumps`.
@@ -81,6 +83,7 @@ impl Default for AppConfig {
             work_dir: PathBuf::from("data"),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             local: false,
+            managed_customer_mode: false,
             identity_mode: IdentityMode::WebUi,
             bootstrap_secret: None,
             dump_prompts: false,
@@ -112,6 +115,7 @@ mod tests {
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(config.identity_mode, IdentityMode::WebUi);
         assert!(config.bootstrap_secret.is_none());
+        assert!(!config.managed_customer_mode);
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
     }

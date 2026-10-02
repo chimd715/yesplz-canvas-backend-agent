@@ -338,6 +338,7 @@ pub struct ConversationService {
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    pub(crate) managed_customer_mode: bool,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
@@ -422,6 +423,7 @@ impl ConversationService {
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            managed_customer_mode: false,
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
@@ -431,6 +433,11 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    pub fn with_managed_customer_mode(mut self, enabled: bool) -> Self {
+        self.managed_customer_mode = enabled;
+        self
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -1068,7 +1075,7 @@ impl ConversationService {
             .and_then(|assistant| assistant.conversation_overrides)
             .map(AssistantConversationOverrides::from)
             .unwrap_or_default();
-        let assistant_snapshot = match assistant_id.as_deref() {
+        let mut assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
                 self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
@@ -1418,6 +1425,16 @@ impl ConversationService {
                         ConversationError::internal(format!("Failed to serialize session MCP snapshot: {e}"))
                     })?,
                 );
+            }
+        }
+
+        if self.managed_customer_mode && effective_type == AgentType::Aionrs {
+            let object = extra.as_object_mut().ok_or_else(|| ConversationError::BadRequest {
+                reason: "Native conversation extra must be an object".into(),
+            })?;
+            object.insert("session_mode".into(), serde_json::json!("yolo"));
+            if let Some(snapshot) = assistant_snapshot.as_mut() {
+                snapshot.resolved_defaults.permission = Some("yolo".into());
             }
         }
 
@@ -2277,13 +2294,22 @@ impl ConversationService {
         req: UpdateConversationRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<ConversationResponse, ConversationError> {
-        let existing = self
+        let mut existing = self
             .conversation_repo
             .get(user_id, id)
             .await?
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+        if self.managed_customer_mode
+            && existing_type == AgentType::Aionrs
+            && let Some(extra) = req.extra.as_ref()
+            && (extra.get("session_mode").is_some() || extra.get("current_mode_id").is_some())
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "Native permissions are managed by the service".into(),
+            });
+        }
 
         // Snapshot invariant: once written at create time, `extra.skills`
         // must not be re-shaped by PATCH. The frontend must clone the
@@ -2329,6 +2355,21 @@ impl ConversationService {
                 ),
             });
         }
+
+        // Every model PATCH takes the gate, even an apparent no-op: a concurrent
+        // update may have changed the model since the ownership read. Re-read
+        // under admission before comparing or writing the canonical model.
+        let _model_change_guard = if self.managed_customer_mode && req.model.is_some() {
+            let guard = self.runtime_state.begin_idle_model_change(id)?;
+            existing = self
+                .conversation_repo
+                .get(user_id, id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+            Some(guard)
+        } else {
+            None
+        };
 
         let now = now_ms();
 
@@ -2398,6 +2439,11 @@ impl ConversationService {
         };
 
         self.conversation_repo.update(user_id, id, &updates).await?;
+        if self.managed_customer_mode && model_changed {
+            task_manager
+                .kill_and_wait(id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+        }
 
         if let Some(model) = req.model.as_ref() {
             let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
@@ -2421,7 +2467,7 @@ impl ConversationService {
             .await?;
         }
 
-        if model_changed {
+        if model_changed && !self.managed_customer_mode {
             info!(
                 model_changed = true,
                 "Conversation updated, killing agent task due to model change"
@@ -2773,6 +2819,13 @@ impl ConversationService {
                 })
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize fork spec: {e}")))?,
             );
+        }
+
+        if self.managed_customer_mode && parent.r#type == "aionrs" {
+            let object = extra.as_object_mut().ok_or_else(|| ConversationError::BadRequest {
+                reason: "Native conversation extra must be an object".into(),
+            })?;
+            object.insert("session_mode".into(), serde_json::json!("yolo"));
         }
 
         let explicit_name = req.name.filter(|n| !n.is_empty());
@@ -4586,13 +4639,29 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
         phase: &'static str,
     ) -> Result<(AgentInstance, bool), ConversationError> {
-        let row = self
+        let mut row = self
             .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        let _preparation_guard = if self.managed_customer_mode && row.r#type == "aionrs" {
+            let guard = self.runtime_state.begin_runtime_preparation(conversation_id)?;
+            // Admission happened after the ownership read. Re-read under the guard
+            // so a model change that completed in between cannot supply stale inputs.
+            row = self
+                .conversation_repo
+                .get(user_id, conversation_id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound {
+                    id: conversation_id.to_owned(),
+                })?;
+            Some(guard)
+        } else {
+            None
+        };
 
         reject_deprecated_runtime_row(&row)?;
 
@@ -4744,9 +4813,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options(row, seed)
+                .await?;
+        self.apply_managed_native_policy(&mut options);
+        Ok(options)
     }
 
     pub async fn build_task_options_for_runtime(
@@ -4756,9 +4828,20 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        self.apply_managed_native_policy(&mut options);
+        Ok(options)
+    }
+
+    fn apply_managed_native_policy(&self, options: &mut BuildTaskOptions) {
+        if self.managed_customer_mode
+            && let AgentSessionKind::Aionrs(context) = &mut options.context.kind
+        {
+            context.config.session_mode = Some("yolo".into());
+        }
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`

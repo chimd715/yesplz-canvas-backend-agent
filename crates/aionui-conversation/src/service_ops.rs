@@ -164,7 +164,18 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
-        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if self.managed_customer_mode && row.r#type == "aionrs" && option_id.trim() == "mode" {
+            return Err(ConversationError::BadRequest {
+                reason: "Native permissions are managed by the service".into(),
+            });
+        }
         if self.runtime_state().is_restarting(conversation_id) {
             return Err(ConversationError::RuntimeRestarting {
                 conversation_id: conversation_id.to_owned(),

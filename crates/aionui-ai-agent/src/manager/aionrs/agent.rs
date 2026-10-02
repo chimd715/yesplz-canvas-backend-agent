@@ -120,6 +120,7 @@ pub struct AionrsAgentManager {
     #[allow(dead_code)] // intentional: lifetime-extension only; see Drop impl
     mcp_managers: Vec<Arc<McpManager>>,
     approval_manager: Arc<ToolApprovalManager>,
+    managed_customer_mode: bool,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
     user_questions: UserQuestions,
@@ -149,6 +150,10 @@ impl AionrsAgentManager {
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let mut config_extra = config_extra;
+        if config_extra.managed_customer_mode {
+            config_extra.session_mode = Some("yolo".into());
+        }
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
@@ -298,6 +303,7 @@ impl AionrsAgentManager {
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
+            managed_customer_mode: config_extra.managed_customer_mode,
             confirmations,
             final_input_dump,
             user_questions,
@@ -606,6 +612,9 @@ impl AionrsAgentManager {
     }
 
     pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+        if self.managed_customer_mode && mode != "yolo" {
+            return Err(AgentError::bad_request("Native permissions are managed by the service"));
+        }
         let prev = self.approval_manager.current_mode();
         self.approval_manager.set_mode(parse_session_mode(mode));
         info!(

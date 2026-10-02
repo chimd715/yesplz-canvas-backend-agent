@@ -206,7 +206,12 @@ pub(super) async fn build(
         max_tool_call_failure_turns: overrides.max_tool_call_failure_turns,
         compat_overrides,
         session_directory,
-        session_mode: overrides.session_mode,
+        session_mode: if deps.managed_customer_mode {
+            Some("yolo".into())
+        } else {
+            overrides.session_mode
+        },
+        managed_customer_mode: deps.managed_customer_mode,
         skills: resolved_skills,
         extra_mcp_servers,
         bedrock_config,

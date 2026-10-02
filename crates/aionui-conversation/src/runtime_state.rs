@@ -19,6 +19,7 @@ pub struct ConversationRuntimeStateService {
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    preparing_conversations: HashMap<String, usize>,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     restarting_conversations: HashSet<String>,
@@ -59,6 +60,37 @@ pub enum RuntimeLifecycleState {
     Deleting,
     Cancelling,
     ShuttingDown,
+}
+
+pub(crate) struct RuntimePreparationGuard {
+    state: Arc<ConversationRuntimeStateService>,
+    conversation_id: String,
+}
+
+impl Drop for RuntimePreparationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.state.lock()
+            && let Some(count) = state.preparing_conversations.get_mut(&self.conversation_id)
+        {
+            *count -= 1;
+            if *count == 0 {
+                state.preparing_conversations.remove(&self.conversation_id);
+            }
+        }
+    }
+}
+
+/// Keeps model reconfiguration exclusive with turn admission, including errors
+/// and cancellation of the update future.
+pub(crate) struct ModelChangeGuard {
+    state: Arc<ConversationRuntimeStateService>,
+    conversation_id: String,
+}
+
+impl Drop for ModelChangeGuard {
+    fn drop(&mut self) {
+        self.state.clear_restarting(&self.conversation_id);
+    }
 }
 
 impl ConversationRuntimeStateService {
@@ -302,7 +334,50 @@ impl ConversationRuntimeStateService {
             .unwrap_or(false)
     }
 
+    pub(crate) fn begin_runtime_preparation(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<RuntimePreparationGuard, ConversationError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
+        if state.restarting_conversations.contains(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+        if state.shutting_down || state.deleting_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: "Conversation runtime is unavailable".into(),
+            });
+        }
+        *state
+            .preparing_conversations
+            .entry(conversation_id.to_owned())
+            .or_default() += 1;
+        Ok(RuntimePreparationGuard {
+            state: self.clone(),
+            conversation_id: conversation_id.to_owned(),
+        })
+    }
+
+    pub(crate) fn begin_idle_model_change(
+        self: &Arc<Self>,
+        conversation_id: &str,
+    ) -> Result<ModelChangeGuard, ConversationError> {
+        self.begin_reconfiguration(conversation_id, true)?;
+        Ok(ModelChangeGuard {
+            state: self.clone(),
+            conversation_id: conversation_id.to_owned(),
+        })
+    }
+
     pub fn begin_restart(&self, conversation_id: &str) -> Result<(), ConversationError> {
+        self.begin_reconfiguration(conversation_id, false)
+    }
+
+    fn begin_reconfiguration(&self, conversation_id: &str, require_idle: bool) -> Result<(), ConversationError> {
         let mut state = self
             .state
             .lock()
@@ -315,6 +390,15 @@ impl ConversationRuntimeStateService {
         if state.deleting_conversations.contains(conversation_id) {
             return Err(ConversationError::Busy {
                 reason: format!("conversation {conversation_id} is being deleted"),
+            });
+        }
+        if require_idle
+            && (state.active_turns.contains_key(conversation_id)
+                || state.cancelling_conversations.contains(conversation_id)
+                || state.preparing_conversations.contains_key(conversation_id))
+        {
+            return Err(ConversationError::Busy {
+                reason: "Wait for the current turn or runtime preparation to finish before changing the model".into(),
             });
         }
         if !state.restarting_conversations.insert(conversation_id.to_owned()) {
@@ -622,6 +706,39 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn model_change_is_exclusive_with_turns_and_runtime_preparation() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let preparation_a = state.begin_runtime_preparation("conversation").unwrap();
+        let preparation_b = state.begin_runtime_preparation("conversation").unwrap();
+        assert!(matches!(
+            state.begin_idle_model_change("conversation"),
+            Err(ConversationError::Busy { .. })
+        ));
+        drop(preparation_a);
+        assert!(state.begin_idle_model_change("conversation").is_err());
+        drop(preparation_b);
+        let change = state.begin_idle_model_change("conversation").unwrap();
+        assert!(matches!(
+            state.try_claim_turn("conversation", "turn"),
+            Err(ConversationError::RuntimeRestarting { .. })
+        ));
+        assert!(matches!(
+            state.begin_runtime_preparation("conversation"),
+            Err(ConversationError::RuntimeRestarting { .. })
+        ));
+        drop(change);
+        let turn = state.try_claim_turn("conversation", "turn").unwrap();
+        assert!(matches!(
+            state.begin_idle_model_change("conversation"),
+            Err(ConversationError::Busy { .. })
+        ));
+        // Existing task recovery must remain available throughout an active turn.
+        assert!(state.begin_runtime_preparation("conversation").is_ok());
+        drop(turn);
+        assert!(state.begin_idle_model_change("conversation").is_ok());
+    }
 
     #[test]
     fn claim_records_active_turn_id_in_summary() {

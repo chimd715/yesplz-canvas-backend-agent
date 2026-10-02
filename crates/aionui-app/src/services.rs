@@ -71,6 +71,7 @@ pub struct AppServices {
     pub encryption_secret_raw: String,
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
+    pub managed_customer_mode: bool,
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
@@ -122,6 +123,7 @@ impl AppServices {
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &self.database,
             work_dir: self.work_dir.clone(),
+            managed_customer_mode: self.managed_customer_mode,
             event_bus: self.event_bus.clone(),
             skill_paths: self.skill_paths.clone(),
             skill_repo: self.skill_repo.clone(),
@@ -366,6 +368,7 @@ impl AppServices {
             acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
             dump_prompts,
+            managed_customer_mode: config.managed_customer_mode,
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
@@ -392,6 +395,7 @@ impl AppServices {
         let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &database,
             work_dir: work_dir.clone(),
+            managed_customer_mode: config.managed_customer_mode,
             event_bus: event_bus.clone(),
             skill_paths: skill_paths.clone(),
             skill_repo: skill_repo.clone(),
@@ -450,6 +454,7 @@ impl AppServices {
             encryption_secret_raw: encryption_secret,
             data_dir,
             dump_prompts,
+            managed_customer_mode: config.managed_customer_mode,
             work_dir,
             local,
             identity_mode,
@@ -465,6 +470,7 @@ impl AppServices {
 }
 
 struct ConversationServiceDeps<'a> {
+    managed_customer_mode: bool,
     database: &'a Database,
     work_dir: PathBuf,
     event_bus: Arc<BroadcastEventBus>,
@@ -498,6 +504,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
+    .with_managed_customer_mode(deps.managed_customer_mode)
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
