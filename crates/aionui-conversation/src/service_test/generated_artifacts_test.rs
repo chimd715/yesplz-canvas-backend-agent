@@ -317,6 +317,7 @@ async fn generated_native_engine_write_creates_file_and_relay_publishes_authenti
         axum::serve(listener, app).await.unwrap();
     });
     let config = AionrsResolvedConfig {
+        managed_customer_mode: true,
         context_limit: None,
         provider: "openai".into(),
         api_key: "local-fixture".into(),
