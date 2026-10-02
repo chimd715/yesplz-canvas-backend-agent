@@ -52,6 +52,8 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
+#[path = "service_test/explicit_skills_test.rs"]
+mod explicit_skills_test;
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
 #[path = "service_test/acp_error_recovery_test.rs"]

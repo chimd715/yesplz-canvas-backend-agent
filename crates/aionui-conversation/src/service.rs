@@ -3771,6 +3771,17 @@ impl ConversationService {
 
         reject_deprecated_runtime_row(&row)?;
 
+        // Explicit customer skills are resolved before persistence or turn claims.
+        // Native managers do not consume inject_skills by themselves, so load the
+        // exact trusted instructions into agent input without rewriting history.
+        let explicit_names = if parse_agent_type_from_row(&row) == Some(AgentType::Aionrs) {
+            crate::explicit_skills::requested_names(&req.content, &req.inject_skills)?
+        } else {
+            Vec::new()
+        };
+        let explicit_prefix =
+            crate::explicit_skills::instruction_prefix(self.skill_resolver.as_ref(), user_id, &explicit_names).await?;
+
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
         // the block can state `workspace: same` without the model comparing
@@ -3958,7 +3969,7 @@ impl ConversationService {
         ConversationTurnOrchestrator::new(self.clone(), Arc::clone(task_manager)).spawn_user_turn(TurnStartInput {
             user_id: user_id.to_owned(),
             conversation: row,
-            content: resolved.content,
+            content: format!("{explicit_prefix}{}", resolved.content),
             files: resolved.files,
             inject_skills: req.inject_skills,
             required_runtime_mode: None,
