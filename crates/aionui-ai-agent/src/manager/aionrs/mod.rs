@@ -1,5 +1,6 @@
 mod content;
 mod error;
+mod prompt_budget;
 
 pub mod agent;
 pub mod history_sanitize;

@@ -194,6 +194,7 @@ pub(super) async fn build(
     )?;
 
     let config = AionrsResolvedConfig {
+        context_limit: row.context_limit.and_then(|value| usize::try_from(value).ok()),
         provider,
         api_key,
         model: model_id,

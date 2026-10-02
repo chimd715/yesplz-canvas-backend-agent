@@ -130,6 +130,8 @@ pub struct AionrsCompatOverrides {
 /// Fully resolved Aionrs configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
+    /// Optional lower provider context limit used by final-request admission.
+    pub context_limit: Option<usize>,
     /// LLM provider name (anthropic, openai, bedrock, vertex).
     pub provider: String,
     /// Decrypted API key.

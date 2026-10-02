@@ -39,6 +39,7 @@ use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::prompt_budget::BudgetedProvider;
 
 fn resolve_aionui_config(cli_args: &CliArgs) -> Result<Config, AgentError> {
     let mut config =
@@ -219,7 +220,14 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        let provider = Arc::new(BudgetedProvider::new(
+            aion_providers::create_provider(&config),
+            &config_extra.model,
+            config_extra.context_limit,
+        ));
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .runtime_env(runtime_env)
+            .provider(provider);
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,

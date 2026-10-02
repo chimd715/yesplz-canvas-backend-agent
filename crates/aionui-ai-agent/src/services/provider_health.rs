@@ -88,6 +88,7 @@ impl ProviderHealthCheckService {
         };
 
         Ok(AionrsResolvedConfig {
+            context_limit: row.context_limit.and_then(|value| usize::try_from(value).ok()),
             provider,
             api_key,
             model: model_id.to_owned(),

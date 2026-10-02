@@ -24,6 +24,7 @@ async fn assert_no_stop_signal(agent: &AionrsAgentManager) {
 
 fn make_test_config() -> AionrsResolvedConfig {
     AionrsResolvedConfig {
+        context_limit: None,
         provider: "anthropic".into(),
         api_key: "sk-test-key".into(),
         model: "claude-sonnet-4-20250514".into(),
@@ -42,6 +43,45 @@ fn make_test_config() -> AionrsResolvedConfig {
         runtime_env: Vec::new(),
         prompt_dump_dir: None,
     }
+}
+
+#[tokio::test]
+async fn managed_oversized_input_is_rejected_by_the_real_engine_before_openai_http() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.provider = "openai".into();
+    config.model = "z-ai/glm-5.3-flash".into();
+    config.base_url = Some(format!("http://{}/v1", listener.local_addr().unwrap()));
+    config.session_directory = directory.path().join("sessions");
+    config.max_turns = Some(1);
+    let agent = AionrsAgentManager::new(
+        "budget-test".into(),
+        directory.path().to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .unwrap();
+    let error = agent
+        .send_message(SendMessageData {
+            content: "한".repeat(100_000),
+            msg_id: "budget-message".into(),
+            turn_id: Some("budget-turn".into()),
+            files: vec![],
+            inject_skills: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.stream_error().code,
+        Some(aionui_api_types::AgentErrorCode::UserLlmProviderContextTooLarge)
+    );
+    assert!(!error.stream_error().message.contains('한'));
+    assert!(
+        timeout(Duration::from_millis(30), listener.accept()).await.is_err(),
+        "an oversized request must never open an upstream HTTP connection"
+    );
 }
 
 fn make_cli_args(project_dir: PathBuf, provider: &str, model: &str) -> CliArgs {
