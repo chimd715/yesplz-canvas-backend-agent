@@ -391,3 +391,83 @@ async fn stop_stream_no_task() {
     // Stop with no active agent is idempotent.
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn answer_ask_requires_auth_and_matching_csrf() {
+    use axum::{body::Body, http::Request};
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "question-owner", "pass123").await;
+    let id = create_conversation(&mut app, &token, &csrf, "Private questions", "acp").await;
+    let path = format!("/api/conversations/{id}/asks/ask-1/answer");
+    let request = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .header("x-csrf-token", &csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(Body::from(r#"{"decline":true}"#))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "UNAUTHORIZED");
+    for submitted_token in [None, Some("invalid")] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .header("cookie", format!("aionui-csrf-token={csrf}"));
+        if let Some(submitted_token) = submitted_token {
+            request = request.header("x-csrf-token", submitted_token);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(r#"{"decline":true}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(body_json(response).await["error"].as_str().unwrap().contains("CSRF"));
+    }
+}
+
+#[tokio::test]
+async fn answer_ask_and_pending_recovery_do_not_cross_customer_ownership() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "question-owner", "pass123").await;
+    let id = create_conversation(&mut app, &owner_token, &owner_csrf, "Private questions", "acp").await;
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other-customer", "pass123").await;
+    let answer = json_with_token(
+        "POST",
+        &format!("/api/conversations/{id}/asks/ask-1/answer"),
+        json!({"decline":true}),
+        &other_token,
+        &other_csrf,
+    );
+    let response = app.clone().oneshot(answer).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(response).await["code"], "NOT_FOUND");
+    let response = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{id}/confirmations"),
+            &other_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "NOT_FOUND");
+    assert!(
+        body.get("data").is_none(),
+        "No question payload may be returned to another customer"
+    );
+    let response = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{id}/confirmations"),
+            &owner_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["data"], json!([]));
+}

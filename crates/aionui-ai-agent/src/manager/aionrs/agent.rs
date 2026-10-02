@@ -37,6 +37,8 @@ use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
+use crate::capability::user_questions::{AskUserQuestionTool, TOOL_NAME, UserQuestions};
+
 use super::content::build_content_blocks;
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
 use super::prompt_budget::BudgetedProvider;
@@ -120,6 +122,7 @@ pub struct AionrsAgentManager {
     approval_manager: Arc<ToolApprovalManager>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     final_input_dump: Option<AionrsFinalInputDumpContext>,
+    user_questions: UserQuestions,
     /// Signalled by `cancel()` to abort an in-flight `engine.run()` via
     /// `tokio::select!` in `send_message()`.
     cancel_notify: Arc<Notify>,
@@ -197,6 +200,9 @@ impl AionrsAgentManager {
 
         let mut config = resolve_aionui_config(&cli_args)?;
 
+        // Asking the customer always waits on its own answer channel, never on a tool permission.
+        config.tools.allow_list.push(TOOL_NAME.into());
+
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;
         config.session.enabled = true;
@@ -265,6 +271,10 @@ impl AionrsAgentManager {
         }
 
         let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let user_questions = UserQuestions::new(conversation_id.clone(), confirmations.clone(), runtime.event_sender());
+        engine
+            .registry_mut()
+            .register(Box::new(AskUserQuestionTool(user_questions.clone())));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
@@ -290,6 +300,7 @@ impl AionrsAgentManager {
             approval_manager,
             confirmations,
             final_input_dump,
+            user_questions,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
         })
@@ -298,12 +309,12 @@ impl AionrsAgentManager {
     fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
         let was_running = self.runtime.status() == Some(ConversationStatus::Running);
 
-        if let Ok(mut confs) = self.confirmations.write() {
-            confs.clear();
-        }
-
         if was_running {
             self.cancel_notify.notify_waiters();
+        }
+        self.user_questions.cancel_all();
+        if let Ok(mut confs) = self.confirmations.write() {
+            confs.clear();
         }
 
         info!(
@@ -531,7 +542,20 @@ impl AionrsAgentManager {
 /// Aionrs-specific operations reached through `AgentInstance::Aionrs(..)`
 /// matches in the routes + services.
 impl AionrsAgentManager {
+    pub fn answer_ask(
+        &self,
+        request_id: &str,
+        answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
+    ) -> Result<(), AgentError> {
+        self.user_questions.answer(request_id, answers)
+    }
+
     pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AgentError> {
+        if self.user_questions.is_pending(call_id) {
+            return Err(AgentError::bad_request(
+                "Questions require the dedicated answer channel",
+            ));
+        }
         if let Ok(mut confs) = self.confirmations.write() {
             confs.retain(|c| c.call_id != call_id);
         }

@@ -11,5 +11,6 @@ pub(crate) mod first_message_injector;
 pub(crate) mod image_input;
 pub mod prompt_pipeline;
 pub(crate) mod skill_manager;
+pub(crate) mod user_questions;
 
 pub use prompt_pipeline::{PostRecvHook, PreSendHook, PromptCtx, PromptPipeline};

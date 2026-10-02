@@ -67,6 +67,7 @@ aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
 aion-providers = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
+aion-tools = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
 aion-types = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
 aion-protocol = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
 aion-config = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }

@@ -44,7 +44,7 @@ pub enum AgentStreamEvent {
     /// `questions` is the raw claude `questions[]` array — the cross-vendor shape
     /// (claude/qwen/grok all converged on it, 2026-08-04 captures):
     /// `[{question, header?, options:[{label, description?}], multiSelect?}]`.
-    /// Answered via the confirm channel with the FULL per-question answer set;
+    /// Answered via the dedicated ask channel with the FULL per-question answer set;
     /// wire tag `ask`.
     Ask(serde_json::Value),
     SkillSuggest(SkillSuggestEventData),

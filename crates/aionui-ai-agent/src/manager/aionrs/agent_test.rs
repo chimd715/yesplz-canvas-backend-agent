@@ -383,3 +383,210 @@ async fn runtime_can_emit_error_and_finish() {
         other => panic!("Expected Finish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn native_question_tool_is_registered_and_cannot_use_permission_confirmation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.session_directory = directory.path().join("sessions");
+    config.session_mode = Some("yolo".into());
+    let agent = AionrsAgentManager::new(
+        "question-test".into(),
+        directory.path().to_string_lossy().into_owned(),
+        config,
+        None,
+    )
+    .await
+    .unwrap();
+    {
+        let mut engine = agent.engine.lock().await;
+        assert!(engine.registry_mut().get(TOOL_NAME).is_some());
+        assert!(!engine.registry_mut().get(TOOL_NAME).unwrap().is_deferred());
+    }
+    let mut events = agent.subscribe();
+    let tool = AskUserQuestionTool(agent.user_questions.clone());
+    let request = tokio::spawn(async move {
+        use aion_tools::Tool;
+        tool.execute(serde_json::json!({"questions":[{"question":"Which color?","options":[{"label":"Blue"}]}]}))
+            .await
+    });
+    let AgentStreamEvent::Ask(payload) = events.recv().await.unwrap() else {
+        panic!("Expected native question");
+    };
+    let id = payload["request_id"].as_str().unwrap();
+    assert_eq!(agent.get_confirmations().len(), 1);
+    assert!(!request.is_finished(), "YOLO must not autoanswer questions");
+    assert_eq!(
+        agent
+            .confirm("", id, serde_json::json!({"value":"proceed_always"}), true)
+            .unwrap_err()
+            .to_string(),
+        "Bad request: Questions require the dedicated answer channel"
+    );
+    assert_eq!(agent.get_confirmations().len(), 1);
+    agent
+        .answer_ask(
+            id,
+            Some(vec![aionui_api_types::AskQuestionAnswer {
+                question: "Which color?".into(),
+                labels: vec!["Blue".into()],
+            }]),
+        )
+        .unwrap();
+    assert!(!request.await.unwrap().is_error);
+    assert!(agent.get_confirmations().is_empty());
+}
+
+#[tokio::test]
+async fn native_engine_question_roundtrip_cancel_and_next_turn_use_dedicated_channel() {
+    use axum::{Json, Router, extract::State, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Clone)]
+    struct Fixture {
+        calls: Arc<AtomicUsize>,
+        inputs: Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+    async fn model(
+        State(state): State<Fixture>,
+        Json(body): Json<Value>,
+    ) -> ([(&'static str, &'static str); 1], String) {
+        state.calls.fetch_add(1, Ordering::SeqCst);
+        state.inputs.lock().unwrap().push(body.clone());
+        let last_role = body["messages"].as_array().unwrap().last().unwrap()["role"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let delta = if last_role == "user" {
+            serde_json::json!({"role":"assistant","tool_calls":[{"index":0,"id":"native-question-call","type":"function","function":{"name":"AskUserQuestion","arguments":serde_json::json!({"questions":[
+                {"question":"Which style?","options":[{"label":"Simple"},{"label":"Detailed"}]},
+                {"question":"Which sections?","options":[{"label":"Summary"},{"label":"Details"}],"multiSelect":true}
+            ]}).to_string()}}]})
+        } else {
+            serde_json::json!({"role":"assistant","content":"Your answers were received."})
+        };
+        let chunk = serde_json::json!({"id":"fixture-response","object":"chat.completion.chunk","created":1,"model":"glm-5.3-flash","choices":[{"index":0,"delta":delta,"finish_reason":if last_role=="user" {"tool_calls"} else {"stop"}}]});
+        (
+            [("content-type", "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+    }
+    async fn next_ask(events: &mut broadcast::Receiver<AgentStreamEvent>) -> String {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let AgentStreamEvent::Ask(payload) = events.recv().await.unwrap() {
+                    return payload["request_id"].as_str().unwrap().to_owned();
+                }
+            }
+        })
+        .await
+        .expect("native engine must emit a formal question")
+    }
+    fn message(id: &str) -> SendMessageData {
+        SendMessageData {
+            content: "Please ask me two questions".into(),
+            msg_id: id.into(),
+            turn_id: Some(format!("turn-{id}")),
+            files: vec![],
+            inject_skills: vec![],
+        }
+    }
+    let state = Fixture {
+        calls: Arc::new(AtomicUsize::new(0)),
+        inputs: Arc::new(std::sync::Mutex::new(vec![])),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(model))
+        .with_state(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = make_test_config();
+    config.provider = "openai".into();
+    config.model = "z-ai/glm-5.3-flash".into();
+    config.base_url = Some(format!("http://{address}/v1"));
+    config.session_directory = directory.path().join("sessions");
+    config.session_mode = Some("yolo".into());
+    let agent = Arc::new(
+        AionrsAgentManager::new(
+            "native-roundtrip".into(),
+            directory.path().to_string_lossy().into_owned(),
+            config,
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    let instance = crate::agent_task::AgentInstance::Aionrs(agent.clone());
+    let mut events = agent.subscribe();
+    let runner = agent.clone();
+    let turn = tokio::spawn(async move { runner.send_message(message("first")).await });
+    let id = next_ask(&mut events).await;
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.status(), Some(ConversationStatus::Running));
+    assert!(!turn.is_finished(), "YOLO must wait for the customer");
+    assert_eq!(agent.get_confirmations().len(), 1);
+    assert_eq!(
+        instance
+            .confirm("first", &id, serde_json::json!({"value":"proceed_once"}), false)
+            .unwrap_err()
+            .to_string(),
+        "Bad request: Questions require the dedicated answer channel"
+    );
+    instance
+        .answer_ask(
+            &id,
+            Some(vec![
+                aionui_api_types::AskQuestionAnswer {
+                    question: "Which style?".into(),
+                    labels: vec!["Simple".into()],
+                },
+                aionui_api_types::AskQuestionAnswer {
+                    question: "Which sections?".into(),
+                    labels: vec!["Summary".into(), "Custom section".into()],
+                },
+            ]),
+        )
+        .unwrap();
+    timeout(Duration::from_secs(10), turn).await.unwrap().unwrap().unwrap();
+    assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+    let requests = state.inputs.lock().unwrap().clone();
+    let tool_message = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap();
+    assert!(tool_message["content"].as_str().unwrap().contains("Custom section"));
+    assert!(agent.get_confirmations().is_empty());
+
+    let runner = agent.clone();
+    let canceled = tokio::spawn(async move { runner.send_message(message("canceled")).await });
+    let canceled_id = next_ask(&mut events).await;
+    agent.cancel().await.unwrap();
+    timeout(Duration::from_secs(10), canceled)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(agent.get_confirmations().is_empty());
+    assert_eq!(
+        instance.answer_ask(&canceled_id, None).unwrap_err().to_string(),
+        "Not found: Pending question not found"
+    );
+    let runner = agent.clone();
+    let resumed = tokio::spawn(async move { runner.send_message(message("after-cancel")).await });
+    let resumed_id = next_ask(&mut events).await;
+    assert_ne!(canceled_id, resumed_id);
+    instance.answer_ask(&resumed_id, None).unwrap();
+    timeout(Duration::from_secs(10), resumed)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(agent.get_confirmations().is_empty());
+    assert_eq!(state.calls.load(Ordering::SeqCst), 5);
+    server.abort();
+}
