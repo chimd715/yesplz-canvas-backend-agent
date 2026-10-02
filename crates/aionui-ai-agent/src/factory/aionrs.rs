@@ -114,6 +114,17 @@ pub(super) async fn build(
     )
     .await;
 
+    if let Some(config) = extra_mcp_servers.get_mut("build-your-own-secrets") {
+        let headers = config.headers.get_or_insert_with(HashMap::new);
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("x-conversation-id"));
+        headers.insert("X-Conversation-Id".into(), ctx.conversation_id.clone());
+    }
+    if extra_mcp_servers.contains_key("build-your-own-secrets") {
+        overrides.system_prompt = merge_skill_index_into_system_prompt(
+            overrides.system_prompt,
+            "Secure secrets: use request_secret to collect credentials through a secure dialog (service opaque for general encrypted storage, github for GitHub account verification), then get_secret_status for opaque references. Only github_identity can currently use a stored GitHub token. Never ask for tokens in chat or ordinary questions, read vault files, print credentials, or insert secrets into prompts/generated source. Pending requests open a separate browser dialog: finish your turn and wait for the user to continue. General secret storage and the fixed GitHub account verification operation are supported; arbitrary resolution or substitution is forbidden.",
+        );
+    }
     if !extra_mcp_servers.is_empty() {
         info!(
             conversation_id = %ctx.conversation_id,
@@ -561,7 +572,7 @@ async fn load_user_mcp_servers(
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
         None => repo.list(user_id).await,
     };
-    let rows = match rows_result {
+    let mut rows = match rows_result {
         Ok(r) => r,
         Err(err) => {
             warn!(
@@ -573,11 +584,21 @@ async fn load_user_mcp_servers(
         }
     };
 
+    // Platform-owned secret tools must survive a frozen customer selection.
+    // They expose references and trusted operations only, never plaintext reads.
+    if let Ok(all_rows) = repo.list(user_id).await {
+        for row in all_rows {
+            if row.name == "build-your-own-secrets" && row.enabled && !rows.iter().any(|item| item.id == row.id) {
+                rows.push(row);
+            }
+        }
+    }
     let mut servers = HashMap::new();
     for row in rows {
-        let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| id == &row.id))
-            .unwrap_or(row.enabled);
+        let selected = row.name == "build-your-own-secrets" && row.enabled
+            || selected_ids
+                .map(|ids| ids.iter().any(|id| id == &row.id))
+                .unwrap_or(row.enabled);
         // `aionui-team` is the reserved team coordination MCP name; a user row
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).
@@ -586,7 +607,13 @@ async fn load_user_mcp_servers(
         }
 
         match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
-            Ok(config) => {
+            Ok(mut config) => {
+                if row.name == "build-your-own-secrets" {
+                    // Bind the transport to this conversation, outside model tool arguments.
+                    let headers = config.headers.get_or_insert_with(HashMap::new);
+                    headers.retain(|name, _| !name.eq_ignore_ascii_case("x-conversation-id"));
+                    headers.insert("X-Conversation-Id".into(), conversation_id.into());
+                }
                 servers.insert(row.name.clone(), config);
             }
             Err(err) => {
@@ -1085,6 +1112,47 @@ mod tests {
 
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(BroadcastEventBus::new(16))
+    }
+
+    #[tokio::test]
+    async fn secure_secret_tools_survive_empty_selection_and_bind_conversation() {
+        let secret = make_row(
+            "build-your-own-secrets",
+            "http",
+            r#"{"url":"http://127.0.0.1:25814/mcp","headers":{"Authorization":"Bearer opaque-capability","x-conversation-id":"spoofed"}}"#,
+            true,
+            false,
+        );
+        let unrelated = make_row(
+            "unselected",
+            "http",
+            r#"{"url":"http://127.0.0.1:25815/mcp"}"#,
+            true,
+            false,
+        );
+        let repo = MockMcpRepo {
+            rows: vec![secret, unrelated],
+        };
+        let servers = load_user_mcp_servers(&repo, Some(&[]), TEST_USER_ID, "actual-chat", test_broadcaster()).await;
+        assert_eq!(servers.len(), 1);
+        let headers = servers["build-your-own-secrets"].headers.as_ref().unwrap();
+        assert_eq!(headers["X-Conversation-Id"], "actual-chat");
+        assert!(!headers.contains_key("x-conversation-id"));
+        assert_eq!(headers["Authorization"], "Bearer opaque-capability");
+    }
+
+    #[tokio::test]
+    async fn disabled_secret_tools_are_not_forced_into_empty_selection() {
+        let row = make_row(
+            "build-your-own-secrets",
+            "http",
+            r#"{"url":"http://127.0.0.1:25814/mcp"}"#,
+            false,
+            false,
+        );
+        let repo = MockMcpRepo { rows: vec![row] };
+        let servers = load_user_mcp_servers(&repo, Some(&[]), TEST_USER_ID, "actual-chat", test_broadcaster()).await;
+        assert!(servers.is_empty());
     }
 
     #[tokio::test]
