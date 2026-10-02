@@ -148,9 +148,65 @@ async fn bound_conversation() -> (
     (root, service, broadcaster, repo, conversation.id)
 }
 
+async fn bound_sqlite_conversation() -> (
+    tempfile::TempDir,
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<aionui_db::SqliteConversationRepository>,
+    String,
+    aionui_db::Database,
+) {
+    let root = tempfile::tempdir().unwrap();
+    let db = init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('user_1', 'artifact-owner', 'hash', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let repo = Arc::new(aionui_db::SqliteConversationRepository::new(db.pool().clone()));
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let service = ConversationService::new(
+        root.path().to_owned(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        Arc::new(MockTaskManager::new()),
+        repo.clone(),
+        Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone())),
+        Arc::new(aionui_db::SqliteAcpSessionRepository::new(db.pool().clone())),
+    );
+    service.with_project_service(Arc::new(aionui_project::ProjectService::new(
+        Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone())),
+        root.path().join("conversations"),
+    )));
+    let conversation = service
+        .create(
+            "user_1",
+            serde_json::from_value(json!({"type":"aionrs", "extra":{"workspace":root.path().to_string_lossy()}}))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Creation returns its original DTO; the best-effort project binding is
+    // persisted separately. Verify the actual owner-scoped stored binding.
+    assert!(
+        repo.get("user_1", &conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project_id
+            .is_some()
+    );
+    broadcaster.take_events();
+    (root, service, broadcaster, repo, conversation.id, db)
+}
+
 #[tokio::test]
 async fn generated_publication_is_owner_scoped_durable_and_contains_only_project_reference() {
-    let (root, service, broadcaster, repo, cid) = bound_conversation().await;
+    // Use the production SQLite schema/repositories, not the HashMap mock:
+    // a generated_file CHECK mismatch previously passed this publication fixture.
+    let (root, service, broadcaster, repo, cid, _db) = bound_sqlite_conversation().await;
     std::fs::write(root.path().join("report.html"), "PRIVATE_DOCUMENT_CONTENT").unwrap();
     let projects = service.project_service().unwrap();
     publish_generated_file(
@@ -193,7 +249,7 @@ async fn generated_publication_is_owner_scoped_durable_and_contains_only_project
         .await
         .is_err()
     );
-    assert_eq!(repo.artifacts.lock().unwrap().len(), 1);
+    assert_eq!(repo.list_artifacts("user_1", &cid).await.unwrap().len(), 1);
     assert!(broadcaster.take_events().is_empty());
 }
 
@@ -303,7 +359,9 @@ async fn generated_native_engine_write_creates_file_and_relay_publishes_authenti
             format!("data: {chunk}\n\ndata: [DONE]\n\n"),
         )
     }
-    let (root, service, broadcaster, repo, cid) = bound_conversation().await;
+    // Exercise actual native Write through the real persistence schema as well
+    // as project ownership, so a rejected artifact cannot hide behind a mock.
+    let (root, service, broadcaster, repo, cid, _db) = bound_sqlite_conversation().await;
     let state = Fixture {
         path: root.path().join("native-output.html").to_string_lossy().into_owned(),
         calls: Arc::new(AtomicUsize::new(0)),
@@ -360,7 +418,7 @@ async fn generated_native_engine_write_creates_file_and_relay_publishes_authenti
             .unwrap()
             .contains("Generated document")
     );
-    assert_eq!(repo.artifacts.lock().unwrap().len(), 1);
+    assert_eq!(repo.list_artifacts("user_1", &cid).await.unwrap().len(), 1);
     let events = broadcaster.take_events();
     let artifact = events
         .iter()

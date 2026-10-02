@@ -593,8 +593,14 @@ impl StreamRelay {
                                 && let Some(path) = generated_calls.observe(data)
                             {
                                 let id = format!("generated-{}", ConversationService::mint_msg_id());
-                                if crate::generated_artifacts::publish_generated_file(&self.repo, projects, &self.broadcaster, &self.user_id, &self.conversation_id, id, &path).await.is_err() {
-                                    debug!(conversation_id = %self.conversation_id, "Generated document was not eligible for preview");
+                                if let Err(error) = crate::generated_artifacts::publish_generated_file(&self.repo, projects, &self.broadcaster, &self.user_id, &self.conversation_id, id, &path).await {
+                                    if matches!(error, crate::ConversationError::Internal { .. } | crate::ConversationError::Busy { .. }) {
+                                        // Persistence errors must be visible in production without
+                                        // logging file paths, contents or raw database errors.
+                                        warn!(conversation_id = %self.conversation_id, "Generated document preview publication failed");
+                                    } else {
+                                        debug!(conversation_id = %self.conversation_id, "Generated document was not eligible for preview");
+                                    }
                                 }
                             }
                         }
